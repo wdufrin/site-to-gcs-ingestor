@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.env
+.env.*
+.venv
+env/
+venv/
+ENV/
+
+# Local crawler outputs & cached documents
+datastore_output_*/
+output_datastore/
+test_output/
+*.jsonl
+
+# Server and execution logs
+*.log
+server.log
+
+# Secret keys, credentials & tokens
+*.pem
+*.key
+*credentials*.json
+service_account*.json
+client_secrets*.json
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

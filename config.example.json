@@ -1,0 +1,27 @@
+{
+  "version": "2.0",
+  "project_id": "my-gcp-project",
+  "location": "global",
+  "gcs_bucket": "my-ai-knowledge-bucket",
+  "gcs_prefix": "website_datastore",
+  "data_store_id": "web-docs-store",
+  "engine_id": "gemini-assistant-app",
+  "schedule": "0 2 * * *",
+  "default_delay": 0.2,
+  "targets": [
+    {
+      "name": "python-docs",
+      "url": "https://docs.python.org/3/tutorial/",
+      "max_depth": 3,
+      "max_pages": 50,
+      "include_patterns": [
+        "*/tutorial/*"
+      ],
+      "exclude_patterns": [
+        "*/archive/*",
+        "*/whatsnew/*",
+        "*/genindex*"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "version": "1.0",
+  "default_delay": 0.2,
+  "targets": [
+    {
+      "name": "python-tutorial",
+      "url": "https://docs.python.org/3/tutorial/",
+      "max_depth": 2,
+      "max_pages": 25,
+      "include_patterns": [],
+      "exclude_patterns": [
+        "*/archive/*",
+        "*/whatsnew/*"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+env/
+server.log
+datastore_output_*
+output_datastore/
+test_output/
+*.png

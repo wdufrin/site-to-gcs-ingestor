@@ -1,0 +1,84 @@
+# Cloud Build Pipeline: Site-to-GCS & Gemini Enterprise Datastore Ingestor
+# =========================================================================
+# Deploys the Cloud Run Function (2nd Gen) and configures Cloud Scheduler
+# for automated recurring delta sync into Vertex AI Search.
+
+steps:
+  # Step 1: Validate dependencies and syntax
+  - name: 'python:3.11-slim'
+    id: 'verify-syntax'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r requirements.txt --quiet
+        python3 -m py_compile main.py app.py web_to_gcs_ai_store.py
+        echo "Syntax check passed successfully."
+
+  # Step 2: Deploy Cloud Run Function (2nd Gen)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+    id: 'deploy-cloud-function'
+    entrypoint: 'gcloud'
+    args:
+      - 'functions'
+      - 'deploy'
+      - '$_FUNCTION_NAME'
+      - '--gen2'
+      - '--runtime=python311'
+      - '--region=$_REGION'
+      - '--source=.'
+      - '--entry-point=index_website_handler'
+      - '--memory=2Gi'
+      - '--timeout=1800s'
+      - '--set-env-vars=GCP_PROJECT=$PROJECT_ID,LOCATION=$_LOCATION,GCS_BUCKET=$_GCS_BUCKET,GCS_PREFIX=$_GCS_PREFIX,DATA_STORE_ID=$_DATA_STORE_ID,ENGINE_ID=$_ENGINE_ID,CONFIG_URI=$_CONFIG_URI'
+
+  # Step 3: Configure or update Cloud Scheduler job with OIDC Auth
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+    id: 'setup-cloud-scheduler'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        FUNCTION_URI=$$(gcloud functions describe $_FUNCTION_NAME --gen2 --region=$_REGION --format='value(serviceConfig.uri)')
+        echo "Cloud Function URL: $$FUNCTION_URI"
+
+        if gcloud scheduler jobs describe $_SCHEDULER_JOB_NAME --location=$_REGION >/dev/null 2>&1; then
+          echo "Updating existing Cloud Scheduler job: $_SCHEDULER_JOB_NAME"
+          gcloud scheduler jobs update http $_SCHEDULER_JOB_NAME \
+            --location=$_REGION \
+            --schedule="$_CRON_SCHEDULE" \
+            --uri="$$FUNCTION_URI" \
+            --http-method=POST \
+            --headers="Content-Type=application/json" \
+            --message-body='{}' \
+            --attempt-deadline=1800s \
+            --oidc-service-account-email="$_SCHEDULER_SA"
+        else
+          echo "Creating new Cloud Scheduler job: $_SCHEDULER_JOB_NAME"
+          gcloud scheduler jobs create http $_SCHEDULER_JOB_NAME \
+            --location=$_REGION \
+            --schedule="$_CRON_SCHEDULE" \
+            --uri="$$FUNCTION_URI" \
+            --http-method=POST \
+            --headers="Content-Type=application/json" \
+            --message-body='{}' \
+            --attempt-deadline=1800s \
+            --oidc-service-account-email="$_SCHEDULER_SA"
+        fi
+        echo "Cloud Scheduler configured to trigger on: $_CRON_SCHEDULE"
+
+substitutions:
+  _FUNCTION_NAME: 'site-datastore-ingestor'
+  _REGION: 'us-central1'
+  _LOCATION: 'global'
+  _GCS_BUCKET: 'my-ai-knowledge-bucket'
+  _GCS_PREFIX: 'website_datastore'
+  _DATA_STORE_ID: 'web-docs-store'
+  _ENGINE_ID: 'gemini-assistant-app'
+  _CONFIG_URI: 'gs://my-ai-knowledge-bucket/website_datastore/config.json'
+  _CRON_SCHEDULE: '0 2 * * *'
+  _SCHEDULER_JOB_NAME: 'site-ingestor-nightly-sync'
+  _SCHEDULER_SA: 'cloud-scheduler-sa@${PROJECT_ID}.iam.gserviceaccount.com'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
