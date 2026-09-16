@@ -27,20 +27,14 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 from urllib.parse import parse_qs, urldefrag, urljoin, urlparse
 
 from main import (
-    WebsiteCrawler,
-    stage_artifacts,
-    upload_to_gcs,
-    ensure_datastore_and_schema,
-    trigger_datastore_import,
-    link_datastore_to_engine,
-    load_targets_config,
+    execute_ingestion,
+    get_datastore_live_status,
     resolve_full_config,
     GCS_AVAILABLE,
-    DISCOVERYENGINE_AVAILABLE,
 )
 
 logging.basicConfig(
@@ -79,205 +73,234 @@ class IngestionWorker:
         self.default_delay = float(self.config.get("delay", 0.2))
         self.dry_run = bool(self.config.get("dry_run", False))
         self.output_dir = Path(self.config.get("output_dir", f"./datastore_output_{job_id}"))
+        self.execution_mode = self.config.get("execution_mode", "local_dry" if self.dry_run else "local_live")
+        self._target_index = 1
+        self._target_total = 1
+
+    def _run_remote_cloud_function(self):
+        """
+        Invokes the deployed Cloud Run Function (2nd Gen) via authenticated OIDC
+        and surfaces the remote execution result in the local UI job logs.
+        """
+        self._update_status(stage="Resolving Cloud Run Function", progress=15, state="running")
+        function_url = self.config.get("function_url", "").strip()
+        func_name = self.config.get("function_name", "site-datastore-ingestor").strip()
+        region = self.config.get("region", "us-central1").strip()
+
+        # Validate identifiers before passing to gcloud subprocess (CWE-77 fix)
+        if not re.match(r"^[a-zA-Z0-9_-]+$", func_name) or not re.match(r"^[a-zA-Z0-9-]+$", region):
+            raise ValueError(f"Invalid function_name '{func_name}' or region '{region}'.")
+
+        if not function_url:
+            add_job_log(self.job_id, "INFO", f"Looking up URL for Cloud Run Function '{func_name}' in {region}...")
+            f_res = subprocess.run(
+                ["gcloud", "functions", "describe", func_name, "--gen2", f"--region={region}", "--format=value(serviceConfig.uri)"],
+                capture_output=True, text=True,
+            )
+            if f_res.returncode == 0 and f_res.stdout.strip():
+                function_url = f_res.stdout.strip()
+            else:
+                raise RuntimeError(
+                    f"Could not auto-detect Cloud Run Function '{func_name}' in region '{region}'. "
+                    f"Ensure it is deployed or provide 'function_url'. ({f_res.stderr.strip()})"
+                )
+
+        add_job_log(self.job_id, "INFO", f"Target Cloud Run Function URI: {function_url}")
+        self._update_status(stage="Acquiring OIDC Identity Token", progress=30)
+
+        token = ""
+        t_res = subprocess.run(
+            ["gcloud", "auth", "print-identity-token", f"--audiences={function_url}"],
+            capture_output=True, text=True,
+        )
+        if t_res.returncode == 0 and t_res.stdout.strip():
+            token = t_res.stdout.strip().splitlines()[-1].strip()
+        else:
+            t_basic = subprocess.run(["gcloud", "auth", "print-identity-token"], capture_output=True, text=True)
+            if t_basic.returncode == 0 and t_basic.stdout.strip():
+                token = t_basic.stdout.strip().splitlines()[-1].strip()
+
+        if not token:
+            raise RuntimeError("Could not acquire OIDC identity token via 'gcloud auth print-identity-token'.")
+
+        add_job_log(self.job_id, "INFO", "Sending crawl & ingestion payload to remote Cloud Run Function...")
+        self._update_status(stage="Executing Remote Cloud Run Function...", progress=55)
+
+        remote_payload = dict(self.config)
+        remote_payload["dry_run"] = False
+        req = urllib.request.Request(
+            function_url,
+            data=json.dumps(remote_payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=1800) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        for stat in result.get("crawler_stats", []):
+            add_job_log(
+                self.job_id, "INFO",
+                f"Remote target '{stat.get('target')}': {stat.get('pages_crawled', 0)} pages crawled, "
+                f"{stat.get('failed_count', 0)} failed/skipped."
+            )
+
+        pages = result.get("pages_count", 0)
+        failed = result.get("failed_count", 0)
+        if result.get("indexing_error"):
+            add_job_log(self.job_id, "ERROR", f"Remote indexing failed: {result['indexing_error']}")
+            self._update_status(
+                stage="Remote Cloud Run Failed During Indexing",
+                progress=100, state="failed", error=result["indexing_error"],
+            )
+            return
+
+        self._update_status(
+            stage="Remote Cloud Run Ingestion Complete!",
+            progress=100,
+            state="completed",
+            metadata_uri=result.get("metadata_uri", ""),
+            import_operation=result.get("import_operation"),
+            failed_count=failed,
+        )
+        add_job_log(
+            self.job_id, "SUCCESS",
+            f"Cloud Run Function finished! {pages} page(s) indexed into '{result.get('data_store_id')}'."
+        )
 
     def run(self):
+        """
+        Drives either the local shared pipeline (main.execute_ingestion) or
+        remote Cloud Run Function execution based on self.execution_mode.
+        """
         try:
+            if self.execution_mode == "cloud_function":
+                self._run_remote_cloud_function()
+                return
             self._update_status(stage="Resolving Targets", progress=5, state="running")
-            targets = load_targets_config(self.config)
 
-            if not targets:
-                raise ValueError("No valid targets found to crawl. Provide a target URL or targets list.")
+            def on_progress(event):
+                kind = event.get("kind")
 
-            add_job_log(self.job_id, "INFO", f"Loaded {len(targets)} crawl target(s). Beginning ingestion...")
+                if kind == "target_start":
+                    self._target_index = event["target_index"]
+                    self._target_total = event["target_total"]
+                    add_job_log(
+                        self.job_id, "INFO",
+                        f"[{event['target_index']}/{event['target_total']}] Crawling "
+                        f"'{event['target']}': {event['url']}"
+                    )
 
-            all_results: List[Dict] = []
-            shared_visited: Set[str] = set()
-
-            total_target_count = len(targets)
-            for target_idx, target in enumerate(targets, start=1):
-                t_url = target.get("url", "").strip()
-                if not t_url:
-                    continue
-                t_name = target.get("name", f"target-{target_idx}")
-                t_max_pages = int(target.get("max_pages", self.config.get("max_pages", 50)))
-                t_max_depth = int(target.get("max_depth", self.config.get("max_depth", 3)))
-                t_delay = float(target.get("delay", self.default_delay))
-                t_includes = target.get("include_patterns", [])
-                t_excludes = target.get("exclude_patterns", [])
-                t_headers = dict(target.get("headers") or {})
-                auth_env = target.get("auth_env_var")
-                if auth_env and os.environ.get(auth_env):
-                    auth_header = target.get("auth_header_name", "Authorization")
-                    t_headers[auth_header] = os.environ[auth_env]
-                t_cookies = dict(target.get("cookies") or {})
-
-                add_job_log(
-                    self.job_id,
-                    "INFO",
-                    f"[{target_idx}/{total_target_count}] Crawling '{t_name}': {t_url} (depth={t_max_depth}, max_pages={t_max_pages})"
-                )
-
-                crawler = WebsiteCrawler(
-                    base_url=t_url,
-                    max_pages=t_max_pages,
-                    max_depth=t_max_depth,
-                    delay_seconds=t_delay,
-                    include_patterns=t_includes,
-                    exclude_patterns=t_excludes,
-                    visited_urls=shared_visited,
-                    target_name=t_name,
-                    headers=t_headers,
-                    cookies=t_cookies,
-                )
-
-                queue: List[Tuple[str, int]] = [(crawler.base_url, 0)]
-                target_pages: List[Dict] = []
-
-                while queue and len(target_pages) < t_max_pages:
-                    url, depth = queue.pop(0)
-                    if url in crawler.visited:
-                        continue
-                    crawler.visited.add(url)
-
-                    add_job_log(self.job_id, "INFO", f"[{t_name} #{len(target_pages) + 1}/{t_max_pages}] {url}")
-
-                    try:
-                        resp = crawler.session.get(url, timeout=12, headers={"Accept": "text/html,application/xhtml+xml"})
-                        if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
-                            continue
-
-                        effective_url = resp.url or url
-                        page_data = crawler._extract_page(resp, effective_url)
-                        if page_data:
-                            target_pages.append(page_data)
-                            all_results.append(page_data)
-
-                            with JOB_LOCK:
-                                if self.job_id not in DOCUMENTS:
-                                    DOCUMENTS[self.job_id] = {}
-                                DOCUMENTS[self.job_id][page_data["id"]] = page_data
-                                JOBS[self.job_id]["pages"] = [
-                                    {
-                                        "id": p["id"],
-                                        "url": p["url"],
-                                        "title": p["title"],
-                                        "target_name": p.get("target_name", ""),
-                                        "word_count": p["word_count"],
-                                        "crawled_at": p["crawled_at"],
-                                    }
-                                    for p in all_results
-                                ]
-
-                            add_job_log(
-                                self.job_id,
-                                "SUCCESS",
-                                f"Extracted: '{page_data['title'][:40]}' ({page_data['word_count']} words)"
-                            )
-
-                        if depth < t_max_depth:
-                            links = crawler._extract_links(resp.text, effective_url)
-                            for link in links:
-                                if link not in crawler.visited:
-                                    queue.append((link, depth + 1))
-
-                    except Exception as ex:
-                        add_job_log(self.job_id, "WARNING", f"Error on {url}: {ex}")
-
-                    # Step progress calculation
-                    base_progress = 10 + int(((target_idx - 1) / total_target_count) * 45)
-                    step_progress = int((len(target_pages) / max(1, t_max_pages)) * (45 / total_target_count))
+                elif kind == "page":
+                    page = event["page"]
+                    with JOB_LOCK:
+                        DOCUMENTS.setdefault(self.job_id, {})[page["id"]] = page
+                        JOBS[self.job_id].setdefault("pages", []).append({
+                            "id": page["id"],
+                            "url": page["url"],
+                            "title": page["title"],
+                            "target_name": page.get("target_name", ""),
+                            "word_count": page["word_count"],
+                            "crawled_at": page["crawled_at"],
+                        })
+                    add_job_log(
+                        self.job_id, "SUCCESS",
+                        f"Extracted: '{page['title'][:40]}' ({page['word_count']} words)"
+                    )
                     self._update_status(
-                        stage=f"Target {target_idx}/{total_target_count} ({t_name}: {len(target_pages)} pages)",
-                        progress=min(base_progress + step_progress, 55)
+                        stage=f"Target {self._target_index}/{self._target_total} "
+                              f"({event['crawled']} pages)",
+                        progress=min(10 + int((event["crawled"] / max(1, event["max_pages"])) * 45), 55),
                     )
-                    time.sleep(t_delay)
 
-                if len(target_pages) >= t_max_pages and len(queue) > 0:
+                elif kind in ("skipped", "error"):
+                    with JOB_LOCK:
+                        JOBS[self.job_id].setdefault("failed_urls", []).append({
+                            "url": event["url"], "reason": event.get("reason", ""),
+                        })
+                    add_job_log(self.job_id, "WARNING", f"Skipped {event['url']}: {event.get('reason')}")
+
+                elif kind == "target_done":
+                    level = "WARNING" if event.get("failed") else "SUCCESS"
                     add_job_log(
-                        self.job_id,
-                        "WARNING",
-                        f"Target '{t_name}' reached max_pages budget ({t_max_pages}) with {len(queue)} pending URLs left in queue. Increase max_pages to crawl the entire site."
-                    )
-                else:
-                    add_job_log(
-                        self.job_id,
-                        "SUCCESS",
-                        f"Target '{t_name}' crawl complete! Extracted {len(target_pages)} reachable pages. Queue exhausted (0 remaining)."
+                        self.job_id, level,
+                        f"Target '{event['target']}' finished: {event['pages']} pages, "
+                        f"{event.get('failed', 0)} failed/skipped."
                     )
 
-            if not all_results:
-                raise ValueError("No valid content pages could be crawled across all specified targets.")
+                elif kind == "stage":
+                    stage_map = {
+                        "staging": ("Structuring AI Markdown & Schema", 60),
+                        "uploading": ("Uploading to Cloud Storage", 75),
+                        "indexing": ("Configuring Discovery Engine Data Store", 85),
+                    }
+                    label, pct = stage_map.get(event["stage"], (event["stage"], 60))
+                    self._update_status(stage=label, progress=pct)
+                    add_job_log(self.job_id, "INFO", label)
 
-            # Step 2: Stage Markdown & Vertex AI Search JSONL Schema
-            self._update_status(stage="Structuring AI Markdown & Schema", progress=60)
-            add_job_log(self.job_id, "INFO", f"Structuring {len(all_results)} clean Markdown documents with frontmatter...")
-
-            saved_files, metadata_path = stage_artifacts(
-                pages=all_results,
+            result = execute_ingestion(
+                self.config,
+                progress_callback=on_progress,
                 staging_dir=str(self.output_dir),
-                bucket_name=self.gcs_bucket or "dry-run-bucket",
-                prefix=self.gcs_prefix,
             )
 
-            clean_prefix = self.gcs_prefix.strip("/")
-            prefix_str = f"{clean_prefix}/" if clean_prefix else ""
-            metadata_gcs_uri = f"gs://{self.gcs_bucket}/{prefix_str}metadata.jsonl" if self.gcs_bucket else f"file://{metadata_path}"
-            add_job_log(self.job_id, "SUCCESS", f"Staged {len(all_results)} Markdown files and metadata.jsonl at {self.output_dir}")
+            failed = result.get("failed_count", 0)
+            pages = result["pages_count"]
 
-            # Step 3: Cloud Storage Upload
-            if self.dry_run or not self.gcs_bucket:
+            if result.get("indexing_error"):
+                # Indexing failed -- the datastore was NOT updated. Do not
+                # present this to the operator as a success.
+                add_job_log(self.job_id, "ERROR", f"Indexing failed: {result['indexing_error']}")
                 self._update_status(
-                    stage="Complete (Local Dry Run)",
-                    progress=100,
-                    state="completed",
-                    metadata_uri=f"file://{os.path.abspath(metadata_path)}",
+                    stage="Ingestion failed during indexing",
+                    progress=100, state="failed",
+                    error=result["indexing_error"],
+                    metadata_uri=result["metadata_uri"],
+                    failed_count=failed,
                 )
-                add_job_log(self.job_id, "SUCCESS", f"Dry run complete. Local artifacts staged at: {os.path.abspath(self.output_dir)}")
                 return
 
-            self._update_status(stage="Uploading to Cloud Storage", progress=75)
-            add_job_log(self.job_id, "INFO", f"Syncing to Cloud Storage: gs://{self.gcs_bucket}/{prefix_str}")
-
-            if not GCS_AVAILABLE:
-                add_job_log(self.job_id, "WARNING", "google-cloud-storage not installed locally. Skipping GCS upload.")
+            rec_used = result.get("reconciliation_mode_used", "INCREMENTAL")
+            rec_setting = result.get("reconciliation_mode", "auto")
+            if rec_used == "FULL":
+                add_job_log(
+                    self.job_id, "INFO",
+                    f"Datastore import triggered in FULL mode (setting: '{rec_setting}'). "
+                    "Any previously indexed pages not in this batch will be purged."
+                )
             else:
-                upload_to_gcs(str(self.output_dir), self.gcs_bucket, self.gcs_prefix)
-                add_job_log(self.job_id, "SUCCESS", f"All files uploaded to GCS. Metadata URI: {metadata_gcs_uri}")
+                reason = (
+                    f"Max Pages budget ({pages} pages) reached"
+                    if not result.get("crawl_complete") and failed == 0
+                    else f"{failed} failed page(s)"
+                    if failed > 0
+                    else "Incremental mode selected"
+                )
+                add_job_log(
+                    self.job_id, "INFO" if failed == 0 else "WARNING",
+                    f"Datastore import triggered in INCREMENTAL mode ({reason}). "
+                    "Existing datastore pages are preserved."
+                )
 
-            # Step 4: Configure Discovery Engine Data Store & Schema
-            import_op_name = None
-            if self.project_id and self.data_store_id:
-                self._update_status(stage="Configuring Discovery Engine Data Store", progress=85)
-                add_job_log(self.job_id, "INFO", f"Connecting to Discovery Engine: Data Store '{self.data_store_id}' (Project: {self.project_id})")
-
-                if not DISCOVERYENGINE_AVAILABLE:
-                    add_job_log(self.job_id, "WARNING", "google-cloud-discoveryengine library not installed locally.")
-                else:
-                    try:
-                        add_job_log(self.job_id, "INFO", "Enforcing schema keyPropertyMapping: mapping 'url' -> 'uri' for public web citations...")
-                        ensure_datastore_and_schema(self.project_id, self.location, self.data_store_id)
-                        add_job_log(self.job_id, "SUCCESS", "Data Store schema configured with keyPropertyMapping (uri -> url)")
-
-                        add_job_log(self.job_id, "INFO", "Triggering Document Import with FULL reconciliation (purging obsolete records)...")
-                        import_op_name = trigger_datastore_import(self.project_id, self.location, self.data_store_id, metadata_gcs_uri)
-                        add_job_log(self.job_id, "SUCCESS", f"Import operation triggered: {import_op_name}")
-
-                        if self.engine_id:
-                            add_job_log(self.job_id, "INFO", f"Attaching Data Store to Gemini Enterprise Engine: {self.engine_id}")
-                            link_datastore_to_engine(self.project_id, self.location, self.engine_id, self.data_store_id)
-                            add_job_log(self.job_id, "SUCCESS", f"Attached to Engine '{self.engine_id}'")
-
-                    except Exception as gcp_err:
-                        add_job_log(self.job_id, "WARNING", f"Discovery Engine notice: {gcp_err}")
+            state_label = "Ingestion Complete & Grounded!" if not failed else \
+                          f"Completed with {failed} failed page(s)"
 
             self._update_status(
-                stage="Ingestion Complete & Grounded!",
+                stage=state_label,
                 progress=100,
-                state="completed",
-                metadata_uri=metadata_gcs_uri,
-                import_operation=import_op_name,
+                state="completed" if not failed else "completed_with_errors",
+                metadata_uri=result["metadata_uri"],
+                import_operation=result.get("import_operation"),
+                failed_count=failed,
+                crawl_complete=result.get("crawl_complete"),
             )
-            add_job_log(self.job_id, "SUCCESS", f"Pipeline finished! Total {len(all_results)} pages indexed across {total_target_count} target(s).")
+            add_job_log(
+                self.job_id, "SUCCESS" if not failed else "WARNING",
+                f"Pipeline finished: {pages} page(s) indexed, {failed} failed, "
+                f"across {result['targets_count']} target(s)."
+            )
 
         except Exception as e:
             logger.error(f"Job {self.job_id} failed: {e}", exc_info=True)
@@ -506,27 +529,106 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               </div>
             </div>
             <div>
-              <label class="block text-[11px] text-slate-300 mb-1">Recurring Schedule (Cloud Scheduler)</label>
-              <input type="text" id="schedule" value="0 2 * * *"
-                     class="glass-input w-full px-3 py-1.5 rounded-lg text-xs text-white font-mono focus:outline-none" onchange="updateDynamicSnippets()">
-              <p class="text-[10px] text-slate-500 mt-1">2:00 AM UTC daily: triggers FULL reconciliation (prunes deleted pages).</p>
+              <label class="block text-[11px] text-slate-300 mb-1 flex items-center justify-between">
+                <span>Recurring Sync Schedule (Cloud Scheduler)</span>
+                <span class="text-[10px] text-slate-500 font-mono">Cron (UTC)</span>
+              </label>
+              <div class="grid grid-cols-12 gap-2">
+                <div class="col-span-7">
+                  <select id="schedulePreset" onchange="onSchedulePresetChange(this.value)"
+                          class="glass-input w-full px-2.5 py-1.5 rounded-lg text-xs text-white focus:outline-none">
+                    <option value="0 */6 * * *">Every 6 Hours</option>
+                    <option value="0 */12 * * *">Every 12 Hours</option>
+                    <option value="0 2 * * *" selected>Daily at 2:00 AM UTC (Default)</option>
+                    <option value="0 0 * * *">Daily at Midnight UTC</option>
+                    <option value="0 2 * * 0">Weekly (Sundays, 2:00 AM UTC)</option>
+                    <option value="0 2 1 * *">Monthly (1st of Month, 2:00 AM)</option>
+                    <option value="custom">Custom Cron Expression...</option>
+                  </select>
+                </div>
+                <div class="col-span-5">
+                  <input type="text" id="schedule" value="0 2 * * *" oninput="onScheduleInputChange(this.value)"
+                         class="glass-input w-full px-2.5 py-1.5 rounded-lg text-xs text-indigo-300 font-mono text-center focus:outline-none">
+                </div>
+              </div>
+              <p id="scheduleHumanText" class="text-[10px] text-slate-400 mt-1">Runs daily at 02:00 UTC via Cloud Scheduler.</p>
             </div>
           </div>
 
-          <!-- Dry Run Checkbox -->
-          <div class="pt-1 flex items-center justify-between border-t border-slate-800">
-            <label class="flex items-center space-x-2 cursor-pointer">
-              <input type="checkbox" id="dry_run" class="w-4 h-4 rounded text-blue-600 bg-slate-900 border-slate-700">
-              <span class="text-xs text-slate-300 font-medium">Local Dry-Run Only (Stage without GCP calls)</span>
+          <!-- Datastore Sync / Reconciliation Mode Selector -->
+          <div class="pt-3 border-t border-slate-800 space-y-2">
+            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+              <i data-lucide="refresh-cw" class="w-3.5 h-3.5 text-emerald-400"></i> Datastore Update Mode
             </label>
+            <input type="hidden" id="reconciliation_mode" value="auto">
+            <div class="grid grid-cols-3 gap-2" id="reconcileModeGroup">
+              <button type="button" id="reconcileMode_auto" onclick="setReconcileMode('auto')"
+                      class="p-2.5 rounded-xl border border-emerald-500/60 bg-emerald-950/30 text-left transition flex flex-col justify-between">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-bold text-white">Auto (Safe)</span>
+                  <i data-lucide="shield-check" class="w-3.5 h-3.5 text-emerald-400"></i>
+                </div>
+                <p class="text-[10px] text-slate-300 mt-1 leading-tight">INCREMENTAL if capped/errors; FULL if complete</p>
+              </button>
+              <button type="button" id="reconcileMode_incremental" onclick="setReconcileMode('incremental')"
+                      class="p-2.5 rounded-xl border border-slate-800 bg-slate-900/60 hover:border-slate-700 text-left transition flex flex-col justify-between">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-bold text-slate-200">Incremental</span>
+                  <i data-lucide="plus-circle" class="w-3.5 h-3.5 text-blue-400"></i>
+                </div>
+                <p class="text-[10px] text-slate-400 mt-1 leading-tight">Upsert only (add/update pages, never delete)</p>
+              </button>
+              <button type="button" id="reconcileMode_full" onclick="setReconcileMode('full')"
+                      class="p-2.5 rounded-xl border border-slate-800 bg-slate-900/60 hover:border-slate-700 text-left transition flex flex-col justify-between">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-bold text-slate-200">Full Replace</span>
+                  <i data-lucide="trash-2" class="w-3.5 h-3.5 text-amber-400"></i>
+                </div>
+                <p class="text-[10px] text-slate-400 mt-1 leading-tight">Mirror index & purge any unlisted pages</p>
+              </button>
+            </div>
+          </div>
+
+          <!-- 3-Way Execution Mode Selector -->
+          <div class="pt-3 border-t border-slate-800 space-y-2">
+            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+              <i data-lucide="cpu" class="w-3.5 h-3.5 text-blue-400"></i> Execution Mode
+            </label>
+            <input type="checkbox" id="dry_run" class="hidden">
+            <div class="grid grid-cols-3 gap-2" id="execModeGroup">
+              <button type="button" id="execMode_local_live" onclick="setExecutionMode('local_live')"
+                      class="p-2.5 rounded-xl border border-blue-500/60 bg-blue-950/40 text-left transition flex flex-col justify-between">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-bold text-white">Local + GCP Sync</span>
+                  <i data-lucide="laptop" class="w-3.5 h-3.5 text-blue-400"></i>
+                </div>
+                <p class="text-[10px] text-slate-300 mt-1 leading-tight">Crawl locally & update GCS + Datastore via ADC</p>
+              </button>
+              <button type="button" id="execMode_local_dry" onclick="setExecutionMode('local_dry')"
+                      class="p-2.5 rounded-xl border border-slate-800 bg-slate-900/60 hover:border-slate-700 text-left transition flex flex-col justify-between">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-bold text-slate-200">Local Dry-Run</span>
+                  <i data-lucide="file-search" class="w-3.5 h-3.5 text-emerald-400"></i>
+                </div>
+                <p class="text-[10px] text-slate-400 mt-1 leading-tight">Stage Markdown & JSONL on disk (zero GCP calls)</p>
+              </button>
+              <button type="button" id="execMode_cloud_function" onclick="setExecutionMode('cloud_function')"
+                      class="p-2.5 rounded-xl border border-slate-800 bg-slate-900/60 hover:border-slate-700 text-left transition flex flex-col justify-between">
+                <div class="flex items-center justify-between">
+                  <span class="text-xs font-bold text-slate-200">Cloud Run Function</span>
+                  <i data-lucide="cloud-lightning" class="w-3.5 h-3.5 text-indigo-400"></i>
+                </div>
+                <p class="text-[10px] text-slate-400 mt-1 leading-tight">Trigger serverless Cloud Run Function via OIDC</p>
+              </button>
+            </div>
           </div>
 
           <!-- Action Button -->
           <div class="pt-2">
             <button type="submit" id="startBtn"
                     class="w-full py-3 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl font-semibold text-sm shadow-lg shadow-blue-500/25 flex items-center justify-center space-x-2 transition active:scale-[0.99]">
-              <i data-lucide="play" class="w-4 h-4 fill-white"></i>
-              <span>Run Local Crawl & Stage Now</span>
+              <i data-lucide="play" class="w-4 h-4 fill-white" id="startBtnIcon"></i>
+              <span id="startBtnText">Run Locally → Sync to GCS & Datastore</span>
             </button>
           </div>
         </form>
@@ -573,6 +675,59 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div id="step2" class="p-2 rounded-lg bg-slate-900/50 border border-slate-800/50">2. AI Markdown</div>
           <div id="step3" class="p-2 rounded-lg bg-slate-900/50 border border-slate-800/50">3. GCS Sync</div>
           <div id="step4" class="p-2 rounded-lg bg-slate-900/50 border border-slate-800/50">4. Gemini DataStore</div>
+        </div>
+      </div>
+
+      <!-- Live Vertex AI Datastore Health & Telemetry Card -->
+      <div class="glass-card rounded-2xl p-5 shadow-xl border border-slate-800/80">
+        <div class="flex items-center justify-between mb-3.5">
+          <div class="flex items-center gap-2.5">
+            <div class="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+              <i data-lucide="database" class="w-4 h-4"></i>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-200">Vertex AI Datastore Telemetry</h3>
+                <span id="dsStateBadge" class="text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">Checking...</span>
+              </div>
+              <p id="dsSubtitle" class="text-[11px] text-slate-400 font-mono mt-0.5">Select Project & Data Store ID to inspect live index</p>
+            </div>
+          </div>
+          <button onclick="fetchDatastoreStatus()" id="refreshDsBtn" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition flex items-center gap-1.5">
+            <i data-lucide="refresh-cw" id="refreshDsIcon" class="w-3.5 h-3.5"></i> Refresh Status
+          </button>
+        </div>
+
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <!-- 1. Indexed Documents -->
+          <div class="p-3 rounded-xl bg-slate-900/70 border border-slate-800/80">
+            <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Indexed Documents</div>
+            <div id="dsDocCount" class="text-lg font-extrabold text-white font-mono mt-1">—</div>
+            <div id="dsFreshestCrawl" class="text-[10px] text-slate-400 truncate mt-0.5">No crawl timestamp</div>
+          </div>
+
+          <!-- 2. Storage Size -->
+          <div class="p-3 rounded-xl bg-slate-900/70 border border-slate-800/80">
+            <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Datastore Size</div>
+            <div id="dsTotalSize" class="text-lg font-extrabold text-blue-400 font-mono mt-1">—</div>
+            <div id="dsSizeBreakdown" class="text-[10px] text-slate-400 truncate mt-0.5">Markdown + metadata</div>
+          </div>
+
+          <!-- 3. Last Import / Sync -->
+          <div class="p-3 rounded-xl bg-slate-900/70 border border-slate-800/80">
+            <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Latest Import LRO</div>
+            <div id="dsLastSyncStatus" class="text-xs font-bold text-emerald-400 mt-1.5 truncate">—</div>
+            <div id="dsLastSyncTime" class="text-[10px] text-slate-400 truncate mt-1">No recent sync</div>
+          </div>
+
+          <!-- 4. Citation Grounding -->
+          <div class="p-3 rounded-xl bg-slate-900/70 border border-slate-800/80">
+            <div class="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Citation Grounding</div>
+            <div id="dsGroundingBadge" class="text-xs font-bold text-emerald-400 mt-1.5 flex items-center gap-1">
+              <span>—</span>
+            </div>
+            <div id="dsSearchTier" class="text-[10px] text-slate-400 truncate mt-1">url → uri schema check</div>
+          </div>
         </div>
       </div>
 
@@ -771,6 +926,98 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       updateDynamicSnippets();
     }
 
+    let currentExecMode = 'local_live';
+
+    function setExecutionMode(mode) {
+      currentExecMode = mode;
+      const modes = ['local_live', 'local_dry', 'cloud_function'];
+      modes.forEach(m => {
+        const el = document.getElementById('execMode_' + m);
+        if (!el) return;
+        if (m === mode) {
+          el.className = 'p-2.5 rounded-xl border border-blue-500/60 bg-blue-950/40 text-left transition flex flex-col justify-between';
+        } else {
+          el.className = 'p-2.5 rounded-xl border border-slate-800 bg-slate-900/60 hover:border-slate-700 text-left transition flex flex-col justify-between';
+        }
+      });
+
+      const dryCheck = document.getElementById('dry_run');
+      if (dryCheck) dryCheck.checked = (mode === 'local_dry');
+
+      const btnText = document.getElementById('startBtnText');
+      if (btnText) {
+        if (mode === 'local_live') {
+          btnText.innerText = 'Run Locally → Sync to GCS & Datastore';
+        } else if (mode === 'local_dry') {
+          btnText.innerText = 'Run Local Dry-Run (No GCP Calls)';
+        } else {
+          btnText.innerText = 'Trigger Remote Cloud Run Function';
+        }
+      }
+    }
+
+    let currentReconcileMode = 'auto';
+
+    function setReconcileMode(mode) {
+      currentReconcileMode = mode || 'auto';
+      const modes = ['auto', 'incremental', 'full'];
+      modes.forEach(m => {
+        const el = document.getElementById('reconcileMode_' + m);
+        if (!el) return;
+        if (m === currentReconcileMode) {
+          const borderCol = m === 'full' ? 'border-amber-500/60 bg-amber-950/30' : (m === 'incremental' ? 'border-blue-500/60 bg-blue-950/40' : 'border-emerald-500/60 bg-emerald-950/30');
+          el.className = `p-2.5 rounded-xl border ${borderCol} text-left transition flex flex-col justify-between`;
+        } else {
+          el.className = 'p-2.5 rounded-xl border border-slate-800 bg-slate-900/60 hover:border-slate-700 text-left transition flex flex-col justify-between';
+        }
+      });
+      const recInput = document.getElementById('reconciliation_mode');
+      if (recInput) recInput.value = currentReconcileMode;
+      updateDynamicSnippets();
+    }
+
+    const CRON_DESCRIPTIONS = {
+      '0 */6 * * *': 'Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC) via Cloud Scheduler.',
+      '0 */12 * * *': 'Runs every 12 hours (00:00 and 12:00 UTC) via Cloud Scheduler.',
+      '0 2 * * *': 'Runs daily at 02:00 AM UTC via Cloud Scheduler.',
+      '0 0 * * *': 'Runs daily at Midnight (00:00 UTC) via Cloud Scheduler.',
+      '0 2 * * 0': 'Runs weekly on Sundays at 02:00 AM UTC via Cloud Scheduler.',
+      '0 2 1 * *': 'Runs monthly on the 1st at 02:00 AM UTC via Cloud Scheduler.'
+    };
+
+    function describeCron(cronStr) {
+      const clean = (cronStr || '').trim().replace(/\\s+/g, ' ');
+      if (CRON_DESCRIPTIONS[clean]) return CRON_DESCRIPTIONS[clean];
+      return clean ? `Custom schedule (${clean} UTC) via Cloud Scheduler.` : 'Enter a valid 5-field cron schedule.';
+    }
+
+    function onSchedulePresetChange(val) {
+      const schedInput = document.getElementById('schedule');
+      if (val !== 'custom' && schedInput) {
+        schedInput.value = val;
+      } else if (val === 'custom' && schedInput) {
+        schedInput.focus();
+      }
+      const humanEl = document.getElementById('scheduleHumanText');
+      if (humanEl) humanEl.innerText = describeCron(schedInput ? schedInput.value : val);
+      updateDynamicSnippets();
+    }
+
+    function onScheduleInputChange(val) {
+      const clean = (val || '').trim().replace(/\\s+/g, ' ');
+      const presetEl = document.getElementById('schedulePreset');
+      if (presetEl) {
+        if (CRON_DESCRIPTIONS[clean]) {
+          presetEl.value = clean;
+        } else {
+          presetEl.value = 'custom';
+        }
+      }
+      const humanEl = document.getElementById('scheduleHumanText');
+      if (humanEl) humanEl.innerText = describeCron(clean);
+      updateDynamicSnippets();
+    }
+
     function renderTargetCards() {
       const container = document.getElementById('targetCardsContainer');
       document.getElementById('targetCount').innerText = targetsList.length;
@@ -862,7 +1109,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           if (cfg.data_store_id) document.getElementById('data_store_id').value = cfg.data_store_id;
           if (cfg.engine_id) document.getElementById('engine_id').value = cfg.engine_id;
           if (cfg.location) document.getElementById('location').value = cfg.location;
-          if (cfg.schedule) document.getElementById('schedule').value = cfg.schedule;
+          if (cfg.schedule) {
+            document.getElementById('schedule').value = cfg.schedule;
+            onScheduleInputChange(cfg.schedule);
+          }
+          if (cfg.reconciliation_mode) setReconcileMode(cfg.reconciliation_mode);
           if (cfg.targets && cfg.targets.length > 0) {
             targetsList = cfg.targets;
             renderTargetCards();
@@ -870,6 +1121,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           statusEl.className = 'text-[11px] text-emerald-400 p-2 rounded-lg bg-emerald-950/30 border border-emerald-800/40 font-medium';
           statusEl.innerHTML = `✅ Successfully pulled live config from <code class="font-mono text-white">${res.uri}</code>`;
           updateDynamicSnippets();
+          fetchDatastoreStatus();
         } else {
           statusEl.className = 'text-[11px] text-rose-400 p-2 rounded-lg bg-rose-950/30 border border-rose-800/40';
           statusEl.innerText = `⚠️ Could not read config from GCS: ${res.message || 'File not found'}`;
@@ -894,6 +1146,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         data_store_id: document.getElementById('data_store_id').value.trim(),
         engine_id: document.getElementById('engine_id').value.trim(),
         schedule: document.getElementById('schedule').value.trim(),
+        reconciliation_mode: currentReconcileMode,
         default_delay: 0.2,
         targets: currentTargetMode === 'multi' ? targetsList : [{
           name: "primary-site",
@@ -929,26 +1182,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     async function triggerCloudRunNow() {
-      const statusEl = document.getElementById('cloudSyncStatus');
-      const project = document.getElementById('project_id').value.trim();
-
-      statusEl.classList.remove('hidden');
-      statusEl.className = 'text-[11px] text-yellow-300 p-2 rounded-lg bg-yellow-950/30 border border-yellow-800/40 animate-pulse';
-      statusEl.innerText = `Sending authenticated trigger to Cloud Run Function...`;
-
-      try {
-        const resp = await fetch('/api/cloud/trigger-run', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({})
-        });
-        const res = await resp.json();
-        statusEl.className = 'text-[11px] text-emerald-400 p-2 rounded-lg bg-emerald-950/30 border border-emerald-800/40 font-medium';
-        statusEl.innerHTML = `🚀 Cloud Run Function triggered successfully! Delta reconciliation started in Google Cloud.`;
-      } catch (err) {
-        statusEl.className = 'text-[11px] text-rose-400 p-2 rounded-lg bg-rose-950/30 border border-rose-800/40';
-        statusEl.innerText = `Trigger error: ${err}`;
-      }
+      setExecutionMode('cloud_function');
+      await handleStartJob({ preventDefault: () => {} });
     }
 
     async function loadDefaultTargetsJson() {
@@ -1092,7 +1327,7 @@ substitutions:
   --entry-point=index_website_handler \\
   --memory=2Gi \\
   --timeout=1800s \\
-  --set-env-vars=GCP_PROJECT="${project}",LOCATION="${location}",GCS_BUCKET="${bucket}",GCS_PREFIX="${prefix}",DATA_STORE_ID="${datastore}",ENGINE_ID="${engine}",CONFIG_URI="${configGcsUri}"`;
+  --set-env-vars=GCP_PROJECT="${project}",LOCATION="${location}",GCS_BUCKET="${bucket}",GCS_PREFIX="${prefix}",DATA_STORE_ID="${datastore}",ENGINE_ID="${engine}",CONFIG_URI="${configGcsUri}",RECONCILIATION_MODE="${currentReconcileMode}"`;
       document.getElementById('snippetDeploy').innerText = deployCmd;
 
       // 3. Cloud Scheduler Command
@@ -1115,6 +1350,7 @@ substitutions:
         data_store_id: datastore,
         engine_id: engine,
         schedule: schedule,
+        reconciliation_mode: currentReconcileMode,
         default_delay: 0.2,
         targets: currentTargetMode === 'multi' ? targetsList : [{
           name: "primary-site",
@@ -1127,13 +1363,14 @@ substitutions:
       document.getElementById('snippetConfig').innerText = JSON.stringify(configPayload, null, 2);
 
       // 5. CLI Command
-      const cliCmd = `python3 web_to_gcs_ai_store.py \\
+      const cliCmd = `.venv/bin/python web_to_gcs_ai_store.py \\
   --targets-file config.json \\
   --gcs-bucket "${bucket}" \\
   --gcs-prefix "${prefix}" \\
   --project-id "${project}" \\
   --data-store-id "${datastore}" \\
-  --engine-id "${engine}"`;
+  --engine-id "${engine}" \\
+  --reconciliation-mode "${currentReconcileMode}"`;
       document.getElementById('snippetCli').innerText = cliCmd;
 
       // 6. cURL Trigger
@@ -1142,7 +1379,7 @@ substitutions:
 curl -X POST "$FUNCTION_URI" \\
   -H "Authorization: Bearer $(gcloud auth print-identity-token)" \\
   -H "Content-Type: application/json" \\
-  -d '{}'`;
+  -d '{"reconciliation_mode": "${currentReconcileMode}"}'`;
 
       // 7. Schema
       const schemaObj = {
@@ -1176,7 +1413,9 @@ curl -X POST "$FUNCTION_URI" \\
         data_store_id: document.getElementById('data_store_id').value,
         engine_id: document.getElementById('engine_id').value,
         location: document.getElementById('location').value,
-        dry_run: document.getElementById('dry_run').checked,
+        reconciliation_mode: currentReconcileMode,
+        dry_run: (currentExecMode === 'local_dry'),
+        execution_mode: currentExecMode,
       };
 
       if (currentTargetMode === 'multi') {
@@ -1225,10 +1464,11 @@ curl -X POST "$FUNCTION_URI" \\
             const job = await rStatus.json();
             updateUIJobState(job);
 
-            if (job.state === 'completed' || job.state === 'failed') {
+            if (job.state === 'completed' || job.state === 'completed_with_errors' || job.state === 'failed') {
               clearInterval(pollInterval);
               document.getElementById('startBtn').disabled = false;
               document.getElementById('startBtn').classList.remove('opacity-50', 'cursor-not-allowed');
+              fetchDatastoreStatus();
             }
           }
 
@@ -1255,6 +1495,9 @@ curl -X POST "$FUNCTION_URI" \\
       } else if (job.state === 'completed') {
         badge.className = 'text-[11px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40';
         badge.innerText = 'Success';
+      } else if (job.state === 'completed_with_errors') {
+        badge.className = 'text-[11px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/40';
+        badge.innerText = 'Completed w/ Warnings';
       } else if (job.state === 'failed') {
         badge.className = 'text-[11px] font-bold uppercase tracking-widest px-2.5 py-1 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/40';
         badge.innerText = 'Failed';
@@ -1334,9 +1577,147 @@ curl -X POST "$FUNCTION_URI" \\
       document.getElementById('docModal').classList.add('hidden');
     }
 
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let i = 0;
+      let val = bytes;
+      while (val >= 1024 && i < units.length - 1) {
+        val /= 1024;
+        i++;
+      }
+      return val.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+    }
+
+    function formatIsoTime(isoStr) {
+      if (!isoStr) return '—';
+      try {
+        const d = new Date(isoStr);
+        if (isNaN(d.getTime())) return isoStr;
+        return d.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+      } catch (e) {
+        return isoStr;
+      }
+    }
+
+    let dsPollTimer = null;
+
+    async function fetchDatastoreStatus() {
+      const project = (document.getElementById('project_id')?.value || '').trim();
+      const location = (document.getElementById('location')?.value || 'global').trim();
+      const datastore = (document.getElementById('data_store_id')?.value || '').trim();
+
+      const badge = document.getElementById('dsStateBadge');
+      const subtitle = document.getElementById('dsSubtitle');
+      const icon = document.getElementById('refreshDsIcon');
+
+      if (!project || !datastore) {
+        badge.className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700';
+        badge.innerText = 'Unconfigured';
+        subtitle.innerText = 'Enter GCP Project ID & Data Store ID to inspect live index';
+        return;
+      }
+
+      if (icon) icon.classList.add('animate-spin');
+      badge.className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/40 animate-pulse';
+      badge.innerText = 'Checking...';
+      subtitle.innerText = `Querying ${project} / ${location} / ${datastore} ...`;
+
+      try {
+        const q = new URLSearchParams({ project_id: project, location: location, data_store_id: datastore });
+        const resp = await fetch(`/api/datastore-status?${q.toString()}`);
+        const data = await resp.json();
+
+        if (!data.exists) {
+          badge.className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/40';
+          badge.innerText = data.state || 'Not Found';
+          subtitle.innerText = data.error || `Data Store '${datastore}' does not exist yet (will be created on first sync).`;
+          document.getElementById('dsDocCount').innerText = '0';
+          document.getElementById('dsFreshestCrawl').innerText = 'Not created yet';
+          document.getElementById('dsTotalSize').innerText = '0 B';
+          document.getElementById('dsSizeBreakdown').innerText = '—';
+          document.getElementById('dsLastSyncStatus').innerText = 'None';
+          document.getElementById('dsLastSyncTime').innerText = '—';
+          document.getElementById('dsGroundingBadge').innerHTML = '<span class="text-slate-400">Pending creation</span>';
+          return;
+        }
+
+        // 1. State badge & subtitle
+        const imp = data.latest_import;
+        const isImporting = imp && imp.done === false;
+        if (isImporting) {
+          badge.className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse';
+          badge.innerText = 'Import Running...';
+          if (dsPollTimer) clearTimeout(dsPollTimer);
+          dsPollTimer = setTimeout(fetchDatastoreStatus, 5000);
+        } else {
+          badge.className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40';
+          badge.innerText = data.state || 'ACTIVE';
+        }
+        subtitle.innerText = `${data.project_id} • ${data.location} • ${data.data_store_id}`;
+
+        // 2. Document Count & Freshest Crawl
+        document.getElementById('dsDocCount').innerText = `${(data.document_count || 0).toLocaleString()} docs`;
+        document.getElementById('dsFreshestCrawl').innerText = data.latest_crawled_at
+          ? `Latest: ${formatIsoTime(data.latest_crawled_at)}`
+          : 'No crawl timestamp found';
+
+        // 3. Storage Size
+        document.getElementById('dsTotalSize').innerText = formatBytes(data.total_bytes || 0);
+        document.getElementById('dsSizeBreakdown').innerText =
+          `${formatBytes(data.unstructured_bytes || 0)} MD • ${formatBytes(data.structured_bytes || 0)} Meta`;
+
+        // 4. Latest Import Operation
+        const syncStatusEl = document.getElementById('dsLastSyncStatus');
+        const syncTimeEl = document.getElementById('dsLastSyncTime');
+        if (imp) {
+          if (!imp.done) {
+            syncStatusEl.className = 'text-xs font-bold text-amber-400 mt-1.5 truncate animate-pulse';
+            syncStatusEl.innerText = `Indexing (${imp.success_count}/${imp.total_count || '?'} docs)...`;
+          } else if (imp.failure_count > 0 && imp.success_count === 0) {
+            syncStatusEl.className = 'text-xs font-bold text-rose-400 mt-1.5 truncate';
+            syncStatusEl.innerText = `Failed (0/${imp.total_count} docs)`;
+          } else {
+            syncStatusEl.className = 'text-xs font-bold text-emerald-400 mt-1.5 truncate';
+            syncStatusEl.innerText = `Succeeded (${imp.success_count}/${imp.total_count} docs)`;
+          }
+          syncTimeEl.innerText = formatIsoTime(imp.update_time || imp.create_time);
+        } else {
+          syncStatusEl.className = 'text-xs font-bold text-slate-400 mt-1.5 truncate';
+          syncStatusEl.innerText = 'No import history';
+          syncTimeEl.innerText = '—';
+        }
+
+        // 5. Citation Grounding
+        const groundEl = document.getElementById('dsGroundingBadge');
+        if (data.citation_grounding_active) {
+          groundEl.className = 'text-xs font-bold text-emerald-400 mt-1.5 flex items-center gap-1';
+          groundEl.innerHTML = '<span>url → uri Active ✅</span>';
+        } else {
+          groundEl.className = 'text-xs font-bold text-amber-400 mt-1.5 flex items-center gap-1';
+          groundEl.innerHTML = '<span>Unmapped ⚠️</span>';
+        }
+        document.getElementById('dsSearchTier').innerText = `Tier: ${data.search_tier || 'STANDARD'}`;
+
+      } catch (err) {
+        badge.className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/40';
+        badge.innerText = 'Error';
+        subtitle.innerText = `Status check error: ${err}`;
+      } finally {
+        if (icon) icon.classList.remove('animate-spin');
+      }
+    }
+
+    // Attach auto-refresh when project or datastore inputs change
+    ['project_id', 'location', 'data_store_id'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', fetchDatastoreStatus);
+    });
+
     // Initialize UI on page load
     renderTargetCards();
     updateDynamicSnippets();
+    fetchDatastoreStatus();
   </script>
 </body>
 </html>
@@ -1400,6 +1781,32 @@ class IngestServerHandler(SimpleHTTPRequestHandler):
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND, "Document not found")
                 return
+
+        elif parsed.path == "/api/datastore-status":
+            qs = parse_qs(parsed.query)
+            project_id = (qs.get("project_id", [""])[0] or os.environ.get("GCP_PROJECT", "")).strip()
+            location = (qs.get("location", ["global"])[0] or "global").strip()
+            data_store_id = (qs.get("data_store_id", [""])[0] or os.environ.get("DATA_STORE_ID", "")).strip()
+            if not project_id or not data_store_id:
+                self._send_json({
+                    "exists": False,
+                    "state": "UNCONFIGURED",
+                    "error": "Enter GCP Project ID and Data Store ID to inspect status.",
+                })
+                return
+            try:
+                status_data = get_datastore_live_status(project_id, location, data_store_id)
+                self._send_json(status_data)
+            except Exception as e:
+                logger.warning(f"Datastore status check failed: {e}")
+                self._send_json({
+                    "exists": False,
+                    "state": "ERROR",
+                    "error": str(e),
+                    "project_id": project_id,
+                    "data_store_id": data_store_id,
+                })
+            return
 
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1598,12 +2005,36 @@ class IngestServerHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def run_gui_server(port: int = 8080):
-    server_address = ("0.0.0.0", port)
-    httpd = ThreadingHTTPServer(server_address, IngestServerHandler)
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+def run_gui_server(port: int = 8085, host: str = "127.0.0.1"):
+    httpd = None
+    for candidate_port in range(port, port + 20):
+        try:
+            httpd = ReusableThreadingHTTPServer((host, candidate_port), IngestServerHandler)
+            if candidate_port != port:
+                print(f"Note: Port {port} was busy; automatically bound to port {candidate_port} instead.")
+            port = candidate_port
+            break
+        except OSError:
+            continue
+
+    if httpd is None:
+        raise RuntimeError(f"Could not find an open port between {port} and {port + 19}.")
+
     print(f"\n==================================================================")
     print(f" Gemini Enterprise Ingestor & Cloud Control Plane Active!")
-    print(f" Web UI: http://localhost:{port}")
+    print(f" Web UI: http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}")
+    if host != "127.0.0.1":
+        print("")
+        print(" *** WARNING *******************************************************")
+        print(" This server has NO authentication. Binding to a non-loopback")
+        print(f" address ({host}) exposes config changes and crawl triggering to")
+        print(" anyone who can reach this port. Use only on a trusted network,")
+        print(" or place it behind Identity-Aware Proxy.")
+        print(" *******************************************************************")
     print(f"==================================================================\n")
     try:
         httpd.serve_forever()
@@ -1614,6 +2045,14 @@ def run_gui_server(port: int = 8080):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Gemini Enterprise Ingestor Web GUI")
-    parser.add_argument("--port", type=int, default=8080, help="Port to bind the web server (default: 8080)")
+    parser.add_argument("--port", type=int, default=8085, help="Port to bind the web server (default: 8085)")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "Address to bind. Defaults to 127.0.0.1 (localhost only) because the UI "
+            "is unauthenticated. Use 0.0.0.0 only inside a container or trusted network."
+        ),
+    )
     args = parser.parse_args()
-    run_gui_server(port=args.port)
+    run_gui_server(port=args.port, host=args.host)

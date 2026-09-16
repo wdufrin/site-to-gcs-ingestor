@@ -1,26 +1,21 @@
 {
   "version": "2.0",
-  "project_id": "my-gcp-project",
+  "project_id": "ancient-sandbox-322523",
   "location": "global",
-  "gcs_bucket": "my-ai-knowledge-bucket",
+  "gcs_bucket": "site-ingest-ancient-sandbox-322523",
   "gcs_prefix": "website_datastore",
   "data_store_id": "web-docs-store",
-  "engine_id": "gemini-assistant-app",
+  "engine_id": "cosmere-1756136513915_1756136523768",
   "schedule": "0 2 * * *",
   "default_delay": 0.2,
   "targets": [
     {
-      "name": "python-docs",
+      "name": "primary-site",
       "url": "https://docs.python.org/3/tutorial/",
-      "max_depth": 3,
-      "max_pages": 50,
-      "include_patterns": [
-        "*/tutorial/*"
-      ],
+      "max_depth": 2,
+      "max_pages": 10,
       "exclude_patterns": [
-        "*/archive/*",
-        "*/whatsnew/*",
-        "*/genindex*"
+        "*/archive/*"
       ]
     }
   ]

@@ -66,19 +66,47 @@ Set the Cloud Run Function environment variable `TARGETS_CONFIG_URI="gs://my-ai-
 
 ---
 
-## 1. Web Management UI
+## 0. Local Setup: Virtual Environment & Authentication
 
-Launch the interactive control plane:
+To avoid conflicts with system Python packages (PEP 668 `externally-managed-environment`), always create and activate a local virtual environment (`.venv`) before installing dependencies or running the ingestor locally:
 
 ```bash
-python3 app.py --port 8080
+# 1. Create a virtual environment in the project root
+python3 -m venv .venv
+
+# 2. Activate the virtual environment
+source .venv/bin/activate
+
+# 3. Install required dependencies inside the venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
+
+# 4. Authenticate Google Cloud Application Default Credentials (ADC)
+#    (Required for Local + GCP Sync and Cloud Run Function execution modes)
+gcloud auth application-default login
+gcloud config set project YOUR_GCP_PROJECT_ID
 ```
 
-Open [http://localhost:8080](http://localhost:8080) in your browser to:
+> **Tip:** Once `.venv` is created, you can run any command explicitly using `.venv/bin/python app.py` or while the virtual environment is activated (`source .venv/bin/activate`).
+
+---
+
+## 1. Web Management UI (Local Control Plane)
+
+Launch the interactive control plane from your virtual environment:
+
+```bash
+.venv/bin/python app.py
+```
+
+Open [http://localhost:8085](http://localhost:8085) in your browser to:
+- Choose between **3 Execution Modes**:
+  1. **Local + GCP Sync**: Crawl locally on your machine, upload Markdown + `metadata.jsonl` to GCS, and update Vertex AI Search Data Store.
+  2. **Local Dry-Run**: Crawl and preview extracted Markdown + `metadata.jsonl` locally on disk without touching GCP.
+  3. **Cloud Run Function**: Trigger your deployed serverless Cloud Run Function remotely via OIDC and stream results live.
 - Toggle between **Single URL** and **Multi-Site Manager**.
 - Add target websites with individual depth sliders, max pages, and exclude pattern filters.
 - Export or load `targets.json`.
-- Execute ingestions locally or sync directly to GCP.
 - Inspect extracted Markdown documents and verify citation metadata.
 - View real-time logs and export `cloudbuild.yaml` CI/CD configurations.
 
@@ -131,18 +159,18 @@ gcloud scheduler jobs create http site-ingestor-nightly-sync \
 
 ## 5. Standalone Terminal CLI
 
-Run the full pipeline directly from the command line:
+Run the full pipeline directly from the command line using your virtual environment:
 
 ```bash
 # Multi-target run
-python3 web_to_gcs_ai_store.py \
+.venv/bin/python web_to_gcs_ai_store.py \
   --targets-file targets.json \
   --gcs-bucket "my-ai-knowledge-bucket" \
   --project-id "my-gcp-project" \
   --data-store-id "web-docs-store"
 
 # Single-target run
-python3 web_to_gcs_ai_store.py \
+.venv/bin/python web_to_gcs_ai_store.py \
   --url "https://docs.example.com" \
   --gcs-bucket "my-ai-knowledge-bucket" \
   --project-id "my-gcp-project" \

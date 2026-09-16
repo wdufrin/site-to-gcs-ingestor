@@ -13,18 +13,19 @@ Cloud Run Function: Website to GCS & Gemini Enterprise Datastore Ingestor
 - Supports multi-target management via direct payload or GCS-hosted targets.json (TARGETS_CONFIG_URI).
 """
 
+import contextlib
+import copy
 import fnmatch
 import hashlib
 import json
 import logging
 import os
 import re
-import subprocess
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
@@ -42,6 +43,12 @@ try:
     DISCOVERYENGINE_AVAILABLE = True
 except ImportError:
     DISCOVERYENGINE_AVAILABLE = False
+
+try:
+    from google.api_core.exceptions import NotFound
+except ImportError:  # pragma: no cover - only when google libs are absent
+    class NotFound(Exception):  # type: ignore[no-redef]
+        """Fallback so except-clauses stay valid without google-api-core."""
 
 try:
     import functions_framework
@@ -175,6 +182,8 @@ class WebsiteCrawler:
         self.exclude_patterns = [p.strip() for p in (exclude_patterns or []) if p.strip()]
         self.visited = visited_urls if visited_urls is not None else set()
         self.target_name = target_name or ""
+        self.failed_urls: List[Dict] = []
+        self.stats: Dict = {}
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self.user_agent})
@@ -300,9 +309,25 @@ class WebsiteCrawler:
                 links.append(abs_url)
         return links
 
-    def crawl(self) -> List[Dict]:
+    def crawl(self, progress_callback: Optional[Callable[[Dict], None]] = None) -> List[Dict]:
+        """
+        Breadth-first crawl of the target site.
+
+        progress_callback, if supplied, is invoked once per attempted URL with a
+        dict describing the attempt. This exists so UIs can show live progress
+        without re-implementing this loop (which previously caused the crawl
+        logic to be maintained in three places).
+        """
         queue: List[Tuple[str, int]] = [(self.base_url, 0)]
         results: List[Dict] = []
+        self.failed_urls: List[Dict] = []
+
+        def _emit(**event):
+            if progress_callback:
+                try:
+                    progress_callback(event)
+                except Exception as cb_err:  # never let UI errors kill a crawl
+                    logger.debug(f"progress_callback raised: {cb_err}")
 
         logger.info(f"Starting crawl at {self.base_url} (Max pages: {self.max_pages}, Max depth: {self.max_depth})")
 
@@ -317,12 +342,31 @@ class WebsiteCrawler:
             try:
                 resp = self.session.get(url, timeout=12, headers={"Accept": "text/html,application/xhtml+xml"})
                 if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
+                    reason = (
+                        f"HTTP {resp.status_code}"
+                        if resp.status_code != 200
+                        else f"non-HTML content-type ({resp.headers.get('Content-Type', 'unknown')})"
+                    )
+                    self.failed_urls.append({"url": url, "reason": reason})
+                    _emit(kind="skipped", url=url, depth=depth, reason=reason,
+                          crawled=len(results), max_pages=self.max_pages)
                     continue
 
                 effective_url = resp.url or url
                 page_data = self._extract_page(resp, effective_url)
                 if page_data:
                     results.append(page_data)
+                    _emit(kind="page", url=effective_url, depth=depth,
+                          title=page_data.get("title", ""), page=page_data,
+                          crawled=len(results), max_pages=self.max_pages)
+                else:
+                    # _extract_page returns None when too little text was found,
+                    # which most often means the page is JavaScript-rendered.
+                    reason = "no extractable content (possible JavaScript-rendered page)"
+                    self.failed_urls.append({"url": url, "reason": reason})
+                    logger.warning(f"Skipped {effective_url}: {reason}")
+                    _emit(kind="skipped", url=effective_url, depth=depth, reason=reason,
+                          crawled=len(results), max_pages=self.max_pages)
 
                 if depth < self.max_depth:
                     new_links = self._extract_links(resp.text, effective_url)
@@ -331,7 +375,11 @@ class WebsiteCrawler:
                             queue.append((link, depth + 1))
 
             except Exception as e:
+                reason = f"{type(e).__name__}: {e}"
+                self.failed_urls.append({"url": url, "reason": reason})
                 logger.warning(f"Error crawling {url}: {e}")
+                _emit(kind="error", url=url, depth=depth, reason=reason,
+                      crawled=len(results), max_pages=self.max_pages)
 
             time.sleep(self.delay_seconds)
 
@@ -344,7 +392,14 @@ class WebsiteCrawler:
             "queue_exhausted": len(queue) == 0,
             "remaining_queue": len(queue),
             "hit_max_pages_limit": len(results) >= self.max_pages and len(queue) > 0,
+            "failed_count": len(self.failed_urls),
+            "failed_urls": self.failed_urls[:50],
         }
+        if self.failed_urls:
+            logger.warning(
+                f"Crawl for '{self.target_name}' had {len(self.failed_urls)} failed/skipped URL(s). "
+                f"These pages are NOT in the index."
+            )
         if self.stats["hit_max_pages_limit"]:
             logger.warning(
                 f"Crawl capped for '{self.target_name}': reached max_pages limit ({self.max_pages}) "
@@ -431,36 +486,93 @@ def upload_to_gcs(staging_dir: str, bucket_name: str, prefix: str) -> None:
     prefix_str = f"{clean_prefix}/" if clean_prefix else ""
     staging_path = Path(staging_dir)
 
-    if GCS_AVAILABLE:
-        try:
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            for file_path in staging_path.rglob("*"):
-                if file_path.is_file():
-                    rel_path = file_path.relative_to(staging_path).as_posix()
-                    blob_name = f"{prefix_str}{rel_path}"
-                    blob = bucket.blob(blob_name)
-                    content_type = "text/markdown" if file_path.suffix == ".md" else "application/json"
-                    blob.upload_from_filename(str(file_path), content_type=content_type)
-                    logger.info(f"Uploaded -> gs://{bucket_name}/{blob_name}")
-            return
-        except Exception as ex:
-            logger.warning(f"Python GCS client upload failed, trying gcloud CLI fallback: {ex}")
+    if not GCS_AVAILABLE:
+        raise RuntimeError(
+            "google-cloud-storage is required to upload artifacts. "
+            "Install it with: pip install google-cloud-storage"
+        )
 
-    # Fallback to gcloud storage CLI
-    target_uri = f"gs://{bucket_name}/{prefix_str}"
-    logger.info(f"Uploading via gcloud storage cp to {target_uri}...")
-    cp_res = subprocess.run(
-        ["gcloud", "storage", "cp", "-r", f"{staging_dir}/*", target_uri],
-        capture_output=True,
-        text=True,
-        shell=True,
-    )
-    if cp_res.returncode != 0:
-        cp_res2 = subprocess.run(["gcloud", "storage", "cp", "-r", staging_dir, target_uri], capture_output=True, text=True)
-        if cp_res2.returncode != 0:
-            raise RuntimeError(f"GCS upload failed: {cp_res.stderr or cp_res2.stderr}")
-    logger.info(f"Successfully uploaded staged files to gs://{bucket_name}/{prefix_str} via gcloud CLI")
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    uploaded = 0
+    for file_path in staging_path.rglob("*"):
+        if file_path.is_file():
+            rel_path = file_path.relative_to(staging_path).as_posix()
+            blob_name = f"{prefix_str}{rel_path}"
+            blob = bucket.blob(blob_name)
+            content_type = "text/markdown" if file_path.suffix == ".md" else "application/json"
+            blob.upload_from_filename(str(file_path), content_type=content_type)
+            uploaded += 1
+            logger.info(f"Uploaded -> gs://{bucket_name}/{blob_name}")
+
+    logger.info(f"Uploaded {uploaded} file(s) to gs://{bucket_name}/{prefix_str}")
+
+
+def _merge_schema(existing_schema: Dict, desired_schema: Dict) -> Tuple[Dict, List[str]]:
+    """
+    Non-destructively merges the desired property definitions into the live
+    Discovery Engine schema.
+
+    Discovery Engine rejects any UpdateSchema request that alters the `type` of
+    an already-established field with:
+        400 Schema update cannot alter the field type. Field type mismatch ...
+
+    This happens because Vertex AI Search auto-infers field types on the first
+    document import (e.g. an ISO-8601 `crawled_at` string is inferred as
+    `datetime`). Blindly PATCHing our hard-coded schema would also wipe out
+    Google-managed annotations (`retrievable`, `indexable`, `searchable`,
+    `dynamicFacetable`) that the datastore has already applied.
+
+    Merge rules:
+      * Fields that do not exist yet are added exactly as desired.
+      * Fields that already exist KEEP their established `type` and all of
+        their existing annotations.
+      * `keyPropertyMapping` is only added when the field does not already have
+        one; an existing (differing) mapping is preserved and reported.
+
+    Returns the merged schema and a list of human-readable change descriptions.
+    An empty change list means the live schema is already correct and no
+    UpdateSchema call is required.
+    """
+    merged = copy.deepcopy(existing_schema) if existing_schema else {}
+    merged.setdefault("$schema", desired_schema.get("$schema"))
+    merged.setdefault("type", "object")
+    existing_props = merged.setdefault("properties", {})
+
+    changes: List[str] = []
+
+    for field, desired_def in desired_schema.get("properties", {}).items():
+        current_def = existing_props.get(field)
+
+        if current_def is None:
+            existing_props[field] = copy.deepcopy(desired_def)
+            changes.append(f"added field '{field}' ({desired_def.get('type')})")
+            continue
+
+        # NEVER alter an established field type -- Discovery Engine rejects it.
+        desired_type = desired_def.get("type")
+        current_type = current_def.get("type")
+        if desired_type and current_type and desired_type != current_type:
+            logger.info(
+                f"Preserving established type for '{field}': "
+                f"'{current_type}' (schema declares '{desired_type}'). "
+                "Discovery Engine does not permit altering field types."
+            )
+
+        desired_kpm = desired_def.get("keyPropertyMapping")
+        current_kpm = current_def.get("keyPropertyMapping")
+        if desired_kpm and not current_kpm:
+            current_def["keyPropertyMapping"] = desired_kpm
+            changes.append(f"set keyPropertyMapping '{field}' -> '{desired_kpm}'")
+        elif desired_kpm and current_kpm != desired_kpm:
+            logger.warning(
+                f"Field '{field}' already maps to key property '{current_kpm}' "
+                f"(expected '{desired_kpm}'). Leaving it unchanged -- key property "
+                "mappings cannot be re-assigned on an existing datastore. "
+                "Recreate the datastore if this mapping is wrong."
+            )
+
+    return merged, changes
 
 
 def ensure_datastore_and_schema(project_id: str, location: str, data_store_id: str) -> None:
@@ -468,6 +580,9 @@ def ensure_datastore_and_schema(project_id: str, location: str, data_store_id: s
     Creates the Discovery Engine Data Store if it doesn't exist, and configures
     the schema with keyPropertyMapping: {"uri": "url"}.
     This forces the Gemini Enterprise assistant to cite public URLs, not gs://!
+
+    The schema update is a MERGE, not an overwrite, so re-running against an
+    existing datastore never fails with a field-type mismatch.
     """
     schema_dict = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -482,123 +597,118 @@ def ensure_datastore_and_schema(project_id: str, location: str, data_store_id: s
         },
     }
 
-    if DISCOVERYENGINE_AVAILABLE:
-        try:
-            client = discoveryengine.DataStoreServiceClient()
-            parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
-            data_store_name = f"{parent}/dataStores/{data_store_id}"
-
-            try:
-                client.get_data_store(name=data_store_name)
-                logger.info(f"DataStore '{data_store_id}' exists.")
-            except Exception:
-                logger.info(f"Creating DataStore '{data_store_id}'...")
-                data_store = discoveryengine.DataStore(
-                    display_name=data_store_id,
-                    industry_vertical=discoveryengine.IndustryVertical.GENERIC,
-                    solution_types=[discoveryengine.SolutionType.SOLUTION_TYPE_SEARCH],
-                    content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
-                )
-                op = client.create_data_store(
-                    parent=parent,
-                    data_store=data_store,
-                    data_store_id=data_store_id,
-                )
-                op.result()
-                logger.info(f"DataStore '{data_store_id}' successfully created.")
-
-            # Configure Schema with keyPropertyMapping (critical for citations)
-            schema_client = discoveryengine.SchemaServiceClient()
-            schema_name = f"{data_store_name}/schemas/default_schema"
-            schema = discoveryengine.Schema(
-                name=schema_name,
-                json_schema=json.dumps(schema_dict),
-            )
-            req = discoveryengine.UpdateSchemaRequest(schema=schema)
-            op = schema_client.update_schema(request=req)
-            op.result()
-            logger.info(f"Configured schema with keyPropertyMapping (uri -> url) on {data_store_id}")
-            return
-        except Exception as e:
-            logger.warning(f"Python Discovery Engine schema client failed, trying REST API fallback: {e}")
-
-    # Fallback via REST API
-    token_res = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True)
-    if token_res.returncode == 0 and token_res.stdout.strip():
-        token = token_res.stdout.strip()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "x-goog-user-project": project_id,
-        }
-        # Update schema via PATCH
-        schema_url = f"https://discoveryengine.googleapis.com/v1/projects/{project_id}/locations/{location}/collections/default_collection/dataStores/{data_store_id}/schemas/default_schema"
-        resp = requests.patch(
-            schema_url,
-            headers=headers,
-            json={"jsonSchema": json.dumps(schema_dict)},
-            timeout=30,
+    if not DISCOVERYENGINE_AVAILABLE:
+        raise RuntimeError(
+            "google-cloud-discoveryengine is required to configure the data store. "
+            "Install it with: pip install google-cloud-discoveryengine"
         )
-        if resp.status_code == 200:
-            logger.info(f"Configured schema via REST API on {data_store_id}")
-        else:
-            logger.warning(f"REST schema update note ({resp.status_code}): {resp.text}")
 
+    client = discoveryengine.DataStoreServiceClient()
+    parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
+    data_store_name = f"{parent}/dataStores/{data_store_id}"
 
-def trigger_datastore_import(project_id: str, location: str, data_store_id: str, metadata_gcs_uri: str) -> str:
-    """
-    Imports documents from metadata.jsonl with FULL reconciliation mode so
-    obsolete pages are removed on scheduled refreshes.
-    """
-    if DISCOVERYENGINE_AVAILABLE:
-        try:
-            doc_client = discoveryengine.DocumentServiceClient()
-            parent = (
-                f"projects/{project_id}/locations/{location}/collections/default_collection/"
-                f"dataStores/{data_store_id}/branches/default_branch"
-            )
-            gcs_source = discoveryengine.GcsSource(
-                input_uris=[metadata_gcs_uri],
-                data_schema="document",
-            )
-            request = discoveryengine.ImportDocumentsRequest(
-                parent=parent,
-                gcs_source=gcs_source,
-                reconciliation_mode=discoveryengine.ImportDocumentsRequest.ReconciliationMode.FULL,
-            )
-            operation = doc_client.import_documents(request=request)
-            op_name = operation.operation.name
-            logger.info(f"Started Discovery Engine import operation: {op_name}")
-            return op_name
-        except Exception as ex:
-            logger.warning(f"Python Discovery Engine client failed, trying REST API fallback: {ex}")
-
-    # Fallback: Discovery Engine REST API using gcloud access token
-    token_res = subprocess.run(["gcloud", "auth", "print-access-token"], capture_output=True, text=True)
-    if token_res.returncode == 0 and token_res.stdout.strip():
-        token = token_res.stdout.strip()
-        url = (
-            f"https://discoveryengine.googleapis.com/v1/projects/{project_id}/locations/{location}/"
-            f"collections/default_collection/dataStores/{data_store_id}/branches/0/documents:import"
+    try:
+        client.get_data_store(name=data_store_name)
+        logger.info(f"DataStore '{data_store_id}' exists.")
+    except NotFound:
+        logger.info(f"Creating DataStore '{data_store_id}'...")
+        data_store = discoveryengine.DataStore(
+            display_name=data_store_id,
+            industry_vertical=discoveryengine.IndustryVertical.GENERIC,
+            solution_types=[discoveryengine.SolutionType.SOLUTION_TYPE_SEARCH],
+            content_config=discoveryengine.DataStore.ContentConfig.CONTENT_REQUIRED,
         )
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "x-goog-user-project": project_id,
-        }
-        payload = {
-            "gcsSource": {"inputUris": [metadata_gcs_uri], "dataSchema": "document"},
-            "reconciliationMode": "FULL",
-        }
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            op_name = resp.json().get("name", "started")
-            logger.info(f"Started Discovery Engine import via REST API: {op_name}")
-            return op_name
-        else:
-            raise RuntimeError(f"Discovery Engine REST import failed ({resp.status_code}): {resp.text}")
+        op = client.create_data_store(
+            parent=parent,
+            data_store=data_store,
+            data_store_id=data_store_id,
+        )
+        op.result()
+        logger.info(f"DataStore '{data_store_id}' successfully created.")
 
-    raise ImportError("google-cloud-discoveryengine missing and gcloud access token unavailable.")
+    # Configure Schema with keyPropertyMapping (critical for citations).
+    # Mapping the 'url' property to the 'uri' key property is what makes Gemini
+    # Enterprise cite the live public page instead of the gs:// object path.
+    schema_client = discoveryengine.SchemaServiceClient()
+    schema_name = f"{data_store_name}/schemas/default_schema"
+
+    existing_schema: Dict = {}
+    try:
+        live = schema_client.get_schema(name=schema_name)
+        if live.json_schema:
+            existing_schema = json.loads(live.json_schema)
+    except NotFound:
+        logger.info("No default_schema found yet; creating it from scratch.")
+    except json.JSONDecodeError:
+        logger.warning("Live schema was not valid JSON; rebuilding from scratch.")
+
+    merged_schema, changes = _merge_schema(existing_schema, schema_dict)
+
+    if not changes:
+        logger.info(
+            f"Schema on '{data_store_id}' already correct "
+            "(url -> uri key property mapping in place). No update needed."
+        )
+        return
+
+    schema = discoveryengine.Schema(
+        name=schema_name,
+        json_schema=json.dumps(merged_schema),
+    )
+    req = discoveryengine.UpdateSchemaRequest(schema=schema)
+    op = schema_client.update_schema(request=req)
+    op.result()
+    logger.info(
+        f"Updated schema on '{data_store_id}': {'; '.join(changes)}"
+    )
+
+
+def trigger_datastore_import(
+    project_id: str,
+    location: str,
+    data_store_id: str,
+    metadata_gcs_uri: str,
+    full_reconcile: bool = True,
+) -> str:
+    """
+    Imports documents from metadata.jsonl into Discovery Engine.
+
+    When full_reconcile=True (default when crawl_complete=True), uses
+    ReconciliationMode.FULL so obsolete/deleted pages are removed on scheduled
+    refreshes. When full_reconcile=False (e.g., crawl capped by max_pages budget
+    or some URLs failed), uses ReconciliationMode.INCREMENTAL so existing
+    datastore documents are NOT purged.
+    """
+    if not DISCOVERYENGINE_AVAILABLE:
+        raise RuntimeError(
+            "google-cloud-discoveryengine is required to import documents. "
+            "Install it with: pip install google-cloud-discoveryengine"
+        )
+
+    doc_client = discoveryengine.DocumentServiceClient()
+    parent = (
+        f"projects/{project_id}/locations/{location}/collections/default_collection/"
+        f"dataStores/{data_store_id}/branches/default_branch"
+    )
+    gcs_source = discoveryengine.GcsSource(
+        input_uris=[metadata_gcs_uri],
+        data_schema="document",
+    )
+    mode = (
+        discoveryengine.ImportDocumentsRequest.ReconciliationMode.FULL
+        if full_reconcile
+        else discoveryengine.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+    )
+    request = discoveryengine.ImportDocumentsRequest(
+        parent=parent,
+        gcs_source=gcs_source,
+        reconciliation_mode=mode,
+    )
+    operation = doc_client.import_documents(request=request)
+    op_name = operation.operation.name
+    mode_name = "FULL" if full_reconcile else "INCREMENTAL"
+    logger.info(f"Started Discovery Engine import operation ({mode_name} mode): {op_name}")
+    return op_name
 
 
 def link_datastore_to_engine(project_id: str, location: str, engine_id: str, data_store_id: str) -> None:
@@ -619,6 +729,131 @@ def link_datastore_to_engine(project_id: str, location: str, engine_id: str, dat
             logger.info(f"DataStore '{data_store_id}' already attached to Engine '{engine_id}'")
     except Exception as ex:
         logger.warning(f"Engine attachment note: {ex}")
+
+
+def get_datastore_live_status(project_id: str, location: str, data_store_id: str) -> Dict:
+    """
+    Queries the live Discovery Engine REST API using Application Default
+    Credentials (with X-Goog-User-Project quota header) to return real-time
+    telemetry for the UI control plane:
+      - Datastore state (ACTIVE / NOT_FOUND) & Search Tier
+      - Exact indexed document count & freshest crawled_at timestamp
+      - Storage size breakdown (unstructured Markdown + structured metadata)
+      - Latest ImportDocuments LRO status (running vs done, success/total count, updateTime)
+      - Citation Grounding verification (whether default_schema maps url -> uri)
+    """
+    import google.auth
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
+    creds, _ = google.auth.default()
+    creds.refresh(GoogleAuthRequest())
+    headers = {
+        "Authorization": f"Bearer {creds.token}",
+        "X-Goog-User-Project": project_id,
+        "Content-Type": "application/json",
+    }
+    host = (
+        f"https://{location}-discoveryengine.googleapis.com"
+        if location and location not in ("global", "")
+        else "https://discoveryengine.googleapis.com"
+    )
+    base = f"{host}/v1/projects/{project_id}/locations/{location or 'global'}/collections/default_collection/dataStores/{data_store_id}"
+
+    # 1. DataStore metadata & billing estimation
+    ds_resp = requests.get(base, headers=headers, timeout=12)
+    if ds_resp.status_code == 404:
+        return {
+            "exists": False,
+            "state": "NOT_FOUND",
+            "data_store_id": data_store_id,
+            "project_id": project_id,
+            "location": location,
+        }
+    ds_resp.raise_for_status()
+    ds = ds_resp.json()
+
+    billing = ds.get("billingEstimation", {})
+    unstructured_bytes = int(billing.get("unstructuredDataSize", 0))
+    structured_bytes = int(billing.get("structuredDataSize", 0))
+    total_bytes = unstructured_bytes + structured_bytes
+
+    # 2. Live Document Count & Freshest crawled_at Timestamp
+    doc_count = 0
+    latest_crawled_at = None
+    page_token = None
+    for _ in range(5):
+        url = f"{base}/branches/default_branch/documents?pageSize=1000"
+        if page_token:
+            url += f"&pageToken={page_token}"
+        d_resp = requests.get(url, headers=headers, timeout=12)
+        if d_resp.status_code != 200:
+            break
+        d_json = d_resp.json()
+        docs = d_json.get("documents", [])
+        doc_count += len(docs)
+        for doc in docs:
+            ca = (doc.get("structData") or {}).get("crawled_at")
+            if ca and (not latest_crawled_at or ca > latest_crawled_at):
+                latest_crawled_at = ca
+        page_token = d_json.get("nextPageToken")
+        if not page_token:
+            break
+
+    # 3. Latest Import Operation (LRO status)
+    ops_resp = requests.get(f"{base}/branches/0/operations?pageSize=10", headers=headers, timeout=12)
+    latest_import = None
+    if ops_resp.status_code == 200:
+        ops = ops_resp.json().get("operations", [])
+        import_ops = [
+            o for o in ops
+            if "import-documents" in o.get("name", "")
+            or "ImportDocuments" in str(o.get("metadata", {}))
+        ]
+        import_ops.sort(key=lambda o: o.get("metadata", {}).get("createTime", ""), reverse=True)
+        if import_ops:
+            top = import_ops[0]
+            meta = top.get("metadata", {})
+            succ = int(meta.get("successCount", 0))
+            fail = int(meta.get("failureCount", 0))
+            tot = int(meta.get("totalCount", succ + fail))
+            latest_import = {
+                "operation_name": top.get("name", "").split("/")[-1],
+                "done": bool(top.get("done", False)),
+                "create_time": meta.get("createTime"),
+                "update_time": meta.get("updateTime"),
+                "success_count": succ,
+                "failure_count": fail,
+                "total_count": tot,
+                "error": top.get("error"),
+            }
+
+    # 4. Schema Citation Grounding Check (url -> uri)
+    schema_resp = requests.get(f"{base}/schemas/default_schema", headers=headers, timeout=12)
+    grounding_active = False
+    if schema_resp.status_code == 200:
+        try:
+            s_json = json.loads(schema_resp.json().get("jsonSchema", "{}"))
+            url_prop = (s_json.get("properties") or {}).get("url") or {}
+            grounding_active = (url_prop.get("keyPropertyMapping") == "uri")
+        except Exception:
+            pass
+
+    return {
+        "exists": True,
+        "data_store_id": data_store_id,
+        "project_id": project_id,
+        "location": location,
+        "display_name": ds.get("displayName", data_store_id),
+        "state": ds.get("state", "ACTIVE"),
+        "search_tier": ds.get("searchTier", "STANDARD"),
+        "document_count": doc_count,
+        "latest_crawled_at": latest_crawled_at,
+        "unstructured_bytes": unstructured_bytes,
+        "structured_bytes": structured_bytes,
+        "total_bytes": total_bytes,
+        "latest_import": latest_import,
+        "citation_grounding_active": grounding_active,
+    }
 
 
 def resolve_full_config(config: Dict) -> Dict:
@@ -671,6 +906,7 @@ def resolve_full_config(config: Dict) -> Dict:
         ("data_store_id", "DATA_STORE_ID"),
         ("engine_id", "ENGINE_ID"),
         ("url", "BASE_URL"),
+        ("reconciliation_mode", "RECONCILIATION_MODE"),
     ]
     for prop, env_k in env_mappings:
         if env_k in os.environ and not merged.get(prop):
@@ -708,8 +944,21 @@ def load_targets_config(config: Dict) -> List[Dict]:
     return []
 
 
-def execute_ingestion(config: Dict) -> Dict:
-    """Core pipeline runner used by Cloud Run Function, Web UI, and CLI."""
+def execute_ingestion(
+    config: Dict,
+    progress_callback: Optional[Callable[[Dict], None]] = None,
+    staging_dir: Optional[str] = None,
+) -> Dict:
+    """
+    Core pipeline runner. This is the single implementation of the
+    crawl -> stage -> upload -> index pipeline; the Cloud Run Function, the web
+    UI and the CLI all call it rather than reimplementing it.
+
+    progress_callback receives per-URL crawl events (see WebsiteCrawler.crawl)
+    plus coarse {"kind": "stage", ...} events for pipeline phases.
+    staging_dir lets a caller keep the generated artifacts (used by --dry-run
+    and by the UI's document preview); when None a temp dir is used and cleaned.
+    """
     full_config = resolve_full_config(config)
 
     bucket_name = full_config.get("gcs_bucket")
@@ -727,8 +976,23 @@ def execute_ingestion(config: Dict) -> Dict:
     if not targets:
         raise ValueError("No crawl targets specified. Provide 'targets' list, 'config_uri', or 'url'.")
 
-    # In Cloud Run, write all temporary files to /tmp
-    with tempfile.TemporaryDirectory(dir="/tmp") as tmp_dir:
+    def _emit(**event):
+        if progress_callback:
+            try:
+                progress_callback(event)
+            except Exception as cb_err:
+                logger.debug(f"progress_callback raised: {cb_err}")
+
+    # Staging location: a caller-supplied dir is kept (used by --dry-run and the
+    # UI preview); otherwise use a temp dir. On Cloud Run /tmp is the only
+    # writable path, so prefer it when present.
+    if staging_dir:
+        Path(staging_dir).mkdir(parents=True, exist_ok=True)
+        staging_ctx: object = contextlib.nullcontext(staging_dir)
+    else:
+        staging_ctx = tempfile.TemporaryDirectory(dir="/tmp" if os.path.isdir("/tmp") else None)
+
+    with staging_ctx as tmp_dir:  # type: ignore[attr-defined]
         # Step 1: Crawl each target website
         all_pages: List[Dict] = []
         crawler_stats: List[Dict] = []
@@ -752,6 +1016,9 @@ def execute_ingestion(config: Dict) -> Dict:
             t_cookies = dict(target.get("cookies") or {})
 
             logger.info(f"[{idx}/{len(targets)}] Crawling target '{t_name}': {t_url} (depth={t_max_depth}, max_pages={t_max_pages})")
+            _emit(kind="target_start", target=t_name, url=t_url,
+                  target_index=idx, target_total=len(targets))
+
             crawler = WebsiteCrawler(
                 base_url=t_url,
                 max_pages=t_max_pages,
@@ -764,16 +1031,23 @@ def execute_ingestion(config: Dict) -> Dict:
                 headers=t_headers,
                 cookies=t_cookies,
             )
-            target_pages = crawler.crawl()
+            target_pages = crawler.crawl(progress_callback=progress_callback)
             all_pages.extend(target_pages)
-            if hasattr(crawler, "stats"):
-                crawler_stats.append(crawler.stats)
+            crawler_stats.append(crawler.stats)
             logger.info(f"Target '{t_name}' completed with {len(target_pages)} valid pages.")
+            _emit(kind="target_done", target=t_name, pages=len(target_pages),
+                  failed=crawler.stats.get("failed_count", 0))
 
         if not all_pages:
             raise ValueError(f"No pages could be extracted from {len(targets)} target(s).")
 
+        total_failed = sum(s.get("failed_count", 0) for s in crawler_stats)
+        crawl_complete = all(
+            s.get("queue_exhausted") and not s.get("failed_count") for s in crawler_stats
+        )
+
         # Step 2: Stage Markdown & metadata.jsonl
+        _emit(kind="stage", stage="staging", pages=len(all_pages))
         saved_files, metadata_path = stage_artifacts(
             pages=all_pages,
             staging_dir=tmp_dir,
@@ -785,27 +1059,50 @@ def execute_ingestion(config: Dict) -> Dict:
 
         # Step 3: Upload to Cloud Storage
         if not dry_run and bucket_name:
+            _emit(kind="stage", stage="uploading", files=len(saved_files))
             upload_to_gcs(tmp_dir, bucket_name, gcs_prefix)
 
         # Step 4: Create/Update Data Store with Schema Key Property Mapping
         import_op = None
+        indexing_error = None
+        reconcile_setting = str(full_config.get("reconciliation_mode") or "auto").lower().strip()
+        if reconcile_setting == "full":
+            use_full_reconcile = True
+        elif reconcile_setting == "incremental":
+            use_full_reconcile = False
+        else:
+            use_full_reconcile = crawl_complete
+
         if not dry_run and project_id and data_store_id:
+            _emit(kind="stage", stage="indexing", data_store=data_store_id)
             try:
                 ensure_datastore_and_schema(project_id, location, data_store_id)
-                import_op = trigger_datastore_import(project_id, location, data_store_id, metadata_gcs_uri)
+                import_op = trigger_datastore_import(
+                    project_id, location, data_store_id, metadata_gcs_uri,
+                    full_reconcile=use_full_reconcile,
+                )
                 if engine_id:
                     link_datastore_to_engine(project_id, location, engine_id, data_store_id)
             except Exception as e:
+                # Surfaced in the return value so callers can stop reporting
+                # unqualified success when indexing actually failed.
+                indexing_error = str(e)
                 logger.error(f"Discovery Engine configuration error: {e}")
 
         return {
-            "status": "completed",
+            "status": "completed" if not indexing_error else "completed_with_errors",
             "targets_count": len(targets),
             "pages_count": len(all_pages),
+            "failed_count": total_failed,
+            "crawl_complete": crawl_complete,
+            "reconciliation_mode": reconcile_setting,
+            "reconciliation_mode_used": "FULL" if use_full_reconcile else "INCREMENTAL",
             "crawler_stats": crawler_stats,
             "metadata_uri": metadata_gcs_uri,
+            "staging_dir": str(tmp_dir),
             "data_store_id": data_store_id,
             "import_operation": import_op,
+            "indexing_error": indexing_error,
             "dry_run": dry_run,
         }
 
