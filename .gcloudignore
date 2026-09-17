@@ -9,3 +9,9 @@ datastore_output_*
 output_datastore/
 test_output/
 *.png
+
+# Exclude credentials and environment secrets from cloud deployments
+#!include:.gitignore
+*.jsonl
+*.log
+

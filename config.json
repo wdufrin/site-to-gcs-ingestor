@@ -7,13 +7,14 @@
   "data_store_id": "web-docs-store",
   "engine_id": "cosmere-1756136513915_1756136523768",
   "schedule": "0 2 * * *",
+  "reconciliation_mode": "full",
   "default_delay": 0.2,
   "targets": [
     {
       "name": "primary-site",
       "url": "https://docs.python.org/3/tutorial/",
-      "max_depth": 2,
-      "max_pages": 10,
+      "max_depth": 5,
+      "max_pages": 300,
       "exclude_patterns": [
         "*/archive/*"
       ]

@@ -32,6 +32,10 @@ server.log
 *credentials*.json
 service_account*.json
 client_secrets*.json
+.gcloud_auth/
+.gcloud_local/
+.gcloud*/
+
 
 # Editor and OS noise
 .DS_Store
