@@ -15,7 +15,7 @@ import json
 import logging
 import sys
 
-from main import execute_ingestion
+from main import execute_ingestion, LOCAL_AUTH_INFO
 
 logging.basicConfig(
     level=logging.INFO,

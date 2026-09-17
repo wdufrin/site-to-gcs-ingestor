@@ -45,6 +45,12 @@ except ImportError:
     DISCOVERYENGINE_AVAILABLE = False
 
 try:
+    from google.api_core.client_options import ClientOptions
+    CLIENT_OPTIONS_AVAILABLE = True
+except ImportError:
+    CLIENT_OPTIONS_AVAILABLE = False
+
+try:
     from google.api_core.exceptions import NotFound
 except ImportError:  # pragma: no cover - only when google libs are absent
     class NotFound(Exception):  # type: ignore[no-redef]
@@ -63,6 +69,143 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("site_ingestor")
+
+
+def configure_local_credentials(base_dir: Optional[Path] = None) -> Dict[str, Optional[str]]:
+    """
+    Auto-discovers and configures local credentials without modifying system ADC.
+    Priority:
+    0. Serverless check (Cloud Run / Cloud Functions) -> use metadata server.
+    1. Explicit GOOGLE_APPLICATION_CREDENTIALS already set in the environment.
+    2. Local .env file in base_dir or project root (e.g. GOOGLE_APPLICATION_CREDENTIALS=...).
+    3. Project-local service account key (service-account.json or service_account.json).
+    4. Project-local isolated gcloud directory (.gcloud_auth/application_default_credentials.json).
+
+    Propagates GOOGLE_APPLICATION_CREDENTIALS and CLOUDSDK_CONFIG into os.environ
+    so both Python SDK client libraries and child gcloud subprocesses inherit them.
+    """
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent
+
+    status: Dict[str, Optional[str]] = {
+        "mode": "system_adc",
+        "credentials_path": os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+        "cloudsdk_config": os.environ.get("CLOUDSDK_CONFIG"),
+        "account": None,
+        "detail": "Using machine default Application Default Credentials (ADC).",
+    }
+
+    # 0. Cloud Run / Cloud Functions serverless execution environment check
+    if os.environ.get("K_SERVICE") or os.environ.get("FUNCTION_TARGET"):
+        status.update({
+            "mode": "cloud_run",
+            "account": "Cloud Run Runtime Service Account",
+            "detail": "Running in Cloud Run / Functions environment (using GCP Metadata Server).",
+        })
+        return status
+
+    def _inspect_cred_file(file_path: Path) -> Tuple[Optional[str], Optional[str]]:
+        if not file_path.is_file():
+            return None, None
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cred_type = data.get("type", "unknown")
+            account = data.get("client_email") or data.get("account")
+            if not account and cred_type == "authorized_user":
+                account = "Authorized User (OAuth2)"
+            return cred_type, account
+        except Exception:
+            return None, None
+
+    # 1. Existing environment variable
+    env_cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_cred and Path(env_cred).is_file():
+        cred_type, account = _inspect_cred_file(Path(env_cred))
+        status.update({
+            "mode": "env",
+            "credentials_path": str(Path(env_cred).resolve()),
+            "account": account,
+            "detail": f"Using credentials from $GOOGLE_APPLICATION_CREDENTIALS ({cred_type or 'custom'}).",
+        })
+        return status
+
+    # 2. Local .env file
+    env_file = base_dir / ".env"
+    if env_file.is_file():
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+        except Exception as e:
+            logger.warning(f"Could not read .env file: {e}")
+
+        env_cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if env_cred and Path(env_cred).is_file():
+            cred_type, account = _inspect_cred_file(Path(env_cred))
+            status.update({
+                "mode": "dotenv",
+                "credentials_path": str(Path(env_cred).resolve()),
+                "account": account,
+                "detail": f"Loaded credentials from local .env ({cred_type or 'custom'}).",
+            })
+            return status
+
+    # 3. Project-local service account key
+    for sa_name in ("service-account.json", "service_account.json"):
+        sa_file = base_dir / sa_name
+        if sa_file.is_file():
+            cred_type, account = _inspect_cred_file(sa_file)
+            abs_path = str(sa_file.resolve())
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = abs_path
+            status.update({
+                "mode": "service_account",
+                "credentials_path": abs_path,
+                "account": account,
+                "detail": f"Using local service account key: {sa_name}",
+            })
+            return status
+
+    # 4. Project-local isolated gcloud directory (.gcloud_auth or .gcloud_local)
+    for gcloud_dir_name in (".gcloud_auth", ".gcloud_local"):
+        gcloud_dir = base_dir / gcloud_dir_name
+        if gcloud_dir.is_dir():
+            abs_gcloud_dir = str(gcloud_dir.resolve())
+            os.environ.setdefault("CLOUDSDK_CONFIG", abs_gcloud_dir)
+            status["cloudsdk_config"] = abs_gcloud_dir
+
+            adc_file = gcloud_dir / "application_default_credentials.json"
+            if adc_file.is_file():
+                abs_adc = str(adc_file.resolve())
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = abs_adc
+                cred_type, account = _inspect_cred_file(adc_file)
+                status.update({
+                    "mode": "isolated_adc",
+                    "credentials_path": abs_adc,
+                    "account": account or "User Account (isolated ADC)",
+                    "detail": f"Using project-isolated user credentials from {gcloud_dir_name}/",
+                })
+                return status
+
+    return status
+
+
+LOCAL_AUTH_INFO = configure_local_credentials()
+
+
+def _get_client_options(project_id: Optional[str] = None):
+    """Constructs ClientOptions with quota_project_id to prevent 403 SERVICE_DISABLED on user ADC."""
+    if CLIENT_OPTIONS_AVAILABLE and project_id:
+        return ClientOptions(quota_project_id=project_id)
+    return None
+
 
 
 def make_doc_id(url: str) -> str:
@@ -480,7 +623,7 @@ def stage_artifacts(
     return saved_files, str(metadata_path)
 
 
-def upload_to_gcs(staging_dir: str, bucket_name: str, prefix: str) -> None:
+def upload_to_gcs(staging_dir: str, bucket_name: str, prefix: str, project_id: Optional[str] = None) -> None:
     """Uploads staged markdown files and metadata.jsonl to Google Cloud Storage."""
     clean_prefix = prefix.strip("/")
     prefix_str = f"{clean_prefix}/" if clean_prefix else ""
@@ -492,7 +635,8 @@ def upload_to_gcs(staging_dir: str, bucket_name: str, prefix: str) -> None:
             "Install it with: pip install google-cloud-storage"
         )
 
-    client = storage.Client()
+    opts = _get_client_options(project_id)
+    client = storage.Client(project=project_id, client_options=opts) if (project_id or opts) else storage.Client()
     bucket = client.bucket(bucket_name)
     uploaded = 0
     for file_path in staging_path.rglob("*"):
@@ -603,7 +747,8 @@ def ensure_datastore_and_schema(project_id: str, location: str, data_store_id: s
             "Install it with: pip install google-cloud-discoveryengine"
         )
 
-    client = discoveryengine.DataStoreServiceClient()
+    opts = _get_client_options(project_id)
+    client = discoveryengine.DataStoreServiceClient(client_options=opts)
     parent = f"projects/{project_id}/locations/{location}/collections/default_collection"
     data_store_name = f"{parent}/dataStores/{data_store_id}"
 
@@ -629,7 +774,7 @@ def ensure_datastore_and_schema(project_id: str, location: str, data_store_id: s
     # Configure Schema with keyPropertyMapping (critical for citations).
     # Mapping the 'url' property to the 'uri' key property is what makes Gemini
     # Enterprise cite the live public page instead of the gs:// object path.
-    schema_client = discoveryengine.SchemaServiceClient()
+    schema_client = discoveryengine.SchemaServiceClient(client_options=opts)
     schema_name = f"{data_store_name}/schemas/default_schema"
 
     existing_schema: Dict = {}
@@ -685,7 +830,8 @@ def trigger_datastore_import(
             "Install it with: pip install google-cloud-discoveryengine"
         )
 
-    doc_client = discoveryengine.DocumentServiceClient()
+    opts = _get_client_options(project_id)
+    doc_client = discoveryengine.DocumentServiceClient(client_options=opts)
     parent = (
         f"projects/{project_id}/locations/{location}/collections/default_collection/"
         f"dataStores/{data_store_id}/branches/default_branch"
@@ -717,7 +863,8 @@ def link_datastore_to_engine(project_id: str, location: str, engine_id: str, dat
         return
 
     try:
-        engine_client = discoveryengine.EngineServiceClient()
+        opts = _get_client_options(project_id)
+        engine_client = discoveryengine.EngineServiceClient(client_options=opts)
         engine_name = f"projects/{project_id}/locations/{location}/collections/default_collection/engines/{engine_id}"
         engine = engine_client.get_engine(name=engine_name)
         if data_store_id not in engine.data_store_ids:
@@ -1060,7 +1207,7 @@ def execute_ingestion(
         # Step 3: Upload to Cloud Storage
         if not dry_run and bucket_name:
             _emit(kind="stage", stage="uploading", files=len(saved_files))
-            upload_to_gcs(tmp_dir, bucket_name, gcs_prefix)
+            upload_to_gcs(tmp_dir, bucket_name, gcs_prefix, project_id=project_id)
 
         # Step 4: Create/Update Data Store with Schema Key Property Mapping
         import_op = None

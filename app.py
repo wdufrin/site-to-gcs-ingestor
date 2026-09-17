@@ -35,7 +35,10 @@ from main import (
     get_datastore_live_status,
     resolve_full_config,
     GCS_AVAILABLE,
+    configure_local_credentials,
+    LOCAL_AUTH_INFO,
 )
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,16 +96,25 @@ class IngestionWorker:
 
         if not function_url:
             add_job_log(self.job_id, "INFO", f"Looking up URL for Cloud Run Function '{func_name}' in {region}...")
+            desc_cmd = [
+                "gcloud", "functions", "describe", func_name,
+                "--gen2", f"--region={region}",
+                "--format=value(serviceConfig.uri)",
+                "--quiet",
+            ]
+            if self.project_id:
+                desc_cmd.append(f"--project={self.project_id}")
             f_res = subprocess.run(
-                ["gcloud", "functions", "describe", func_name, "--gen2", f"--region={region}", "--format=value(serviceConfig.uri)"],
+                desc_cmd,
                 capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=30,
             )
             if f_res.returncode == 0 and f_res.stdout.strip():
                 function_url = f_res.stdout.strip()
             else:
                 raise RuntimeError(
                     f"Could not auto-detect Cloud Run Function '{func_name}' in region '{region}'. "
-                    f"Ensure it is deployed or provide 'function_url'. ({f_res.stderr.strip()})"
+                    f"Ensure it is deployed in project '{self.project_id}' or provide 'function_url'. ({f_res.stderr.strip()})"
                 )
 
         add_job_log(self.job_id, "INFO", f"Target Cloud Run Function URI: {function_url}")
@@ -112,11 +124,16 @@ class IngestionWorker:
         t_res = subprocess.run(
             ["gcloud", "auth", "print-identity-token", f"--audiences={function_url}"],
             capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=30,
         )
         if t_res.returncode == 0 and t_res.stdout.strip():
             token = t_res.stdout.strip().splitlines()[-1].strip()
         else:
-            t_basic = subprocess.run(["gcloud", "auth", "print-identity-token"], capture_output=True, text=True)
+            t_basic = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, timeout=30,
+            )
             if t_basic.returncode == 0 and t_basic.stdout.strip():
                 token = t_basic.stdout.strip().splitlines()[-1].strip()
 
@@ -1895,7 +1912,20 @@ class IngestServerHandler(SimpleHTTPRequestHandler):
                 if not function_url:
                     func_name = data.get("function_name", "site-datastore-ingestor")
                     reg = data.get("region", "us-central1")
-                    f_res = subprocess.run(["gcloud", "functions", "describe", func_name, "--gen2", f"--region={reg}", "--format=value(serviceConfig.uri)"], capture_output=True, text=True)
+                    proj = data.get("project_id") or os.environ.get("GCP_PROJECT", "")
+                    func_cmd = [
+                        "gcloud", "functions", "describe", func_name,
+                        "--gen2", f"--region={reg}",
+                        "--format=value(serviceConfig.uri)",
+                        "--quiet",
+                    ]
+                    if proj:
+                        func_cmd.append(f"--project={proj}")
+                    f_res = subprocess.run(
+                        func_cmd,
+                        capture_output=True, text=True,
+                        stdin=subprocess.DEVNULL, timeout=30,
+                    )
                     if f_res.returncode == 0 and f_res.stdout.strip():
                         function_url = f_res.stdout.strip()
                     else:
@@ -1904,21 +1934,27 @@ class IngestServerHandler(SimpleHTTPRequestHandler):
 
                 token = ""
                 # 1. Try direct print-identity-token with audience
-                t_res = subprocess.run(["gcloud", "auth", "print-identity-token", f"--audiences={function_url}"], capture_output=True, text=True)
+                t_res = subprocess.run(
+                    ["gcloud", "auth", "print-identity-token", f"--audiences={function_url}"],
+                    capture_output=True, text=True,
+                    stdin=subprocess.DEVNULL, timeout=30,
+                )
                 if t_res.returncode == 0 and t_res.stdout.strip():
                     token = t_res.stdout.strip().splitlines()[-1].strip()
                 else:
                     # 2. Try with compute service account impersonation dynamically
                     sa = data.get("service_account")
                     if not sa:
-                        pnum_res = subprocess.run(["gcloud", "projects", "describe", data.get("project_id") or os.environ.get("GCP_PROJECT", ""), "--format=value(projectNumber)"], capture_output=True, text=True)
+                        pnum_cmd = ["gcloud", "projects", "describe", data.get("project_id") or os.environ.get("GCP_PROJECT", ""), "--format=value(projectNumber)"]
+                        pnum_res = subprocess.run(pnum_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
                         if pnum_res.returncode == 0 and pnum_res.stdout.strip():
                             sa = f"{pnum_res.stdout.strip()}-compute@developer.gserviceaccount.com"
 
                     if sa:
                         t_imp = subprocess.run(
                             ["gcloud", "auth", "print-identity-token", f"--audiences={function_url}", f"--impersonate-service-account={sa}"],
-                            capture_output=True, text=True
+                            capture_output=True, text=True,
+                            stdin=subprocess.DEVNULL, timeout=30,
                         )
                         if t_imp.returncode == 0 and t_imp.stdout.strip():
                             valid_lines = [l.strip() for l in t_imp.stdout.splitlines() if l.strip() and not l.startswith("WARNING:")]
@@ -1927,7 +1963,7 @@ class IngestServerHandler(SimpleHTTPRequestHandler):
 
                 if not token:
                     # 3. Fallback to basic print-identity-token
-                    t_basic = subprocess.run(["gcloud", "auth", "print-identity-token"], capture_output=True, text=True)
+                    t_basic = subprocess.run(["gcloud", "auth", "print-identity-token"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
                     token = t_basic.stdout.strip().splitlines()[-1].strip() if t_basic.stdout.strip() else ""
 
                 if not token:
