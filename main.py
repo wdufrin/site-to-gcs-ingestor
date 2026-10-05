@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import parse_qs, urldefrag, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -218,10 +218,58 @@ def make_doc_id(url: str) -> str:
     return f"{slug[:40]}_{hash_suffix}"
 
 
-def html_to_markdown(soup_node: Tag) -> str:
+def unwrap_redirect_url(url: str) -> str:
+    """
+    Unwraps redirector URLs (such as Google Sites / Google Docs / Google Search
+    `https://www.google.com/url?q=<target>&sa=D...`) so that extracted links point
+    directly to the canonical destination URL instead of triggering an interstitial
+    "Google is redirecting you" ("Redirect Notice") screen.
+    """
+    current = (url or "").strip()
+    for _ in range(3):
+        if not current:
+            break
+        parsed = urlparse(current)
+        host = parsed.netloc.lower()
+        if host in ("www.google.com", "google.com") and parsed.path in ("/url", "/url/"):
+            qs = parse_qs(parsed.query)
+            target = (qs.get("q") or qs.get("url") or [None])[0]
+            if target and target.strip().startswith(("http://", "https://")):
+                current = target.strip()
+                continue
+        break
+    return current
+
+
+def resolve_and_clean_url(href: str, base_url: Optional[str] = None) -> str:
+    """
+    Resolves a raw HTML href attribute into a clean, canonical absolute URL:
+    1. Rejects empty, '#', javascript:, vbscript:, and data: pseudo-links.
+    2. Unwraps Google redirect wrappers (https://www.google.com/url?q=...).
+    3. Resolves relative paths (e.g. 'subpage.html', '../index.html', '/docs/a', '#section')
+       against the page's base_url so the LLM never sees broken relative fragments.
+    """
+    raw = (href or "").strip()
+    if not raw or raw == "#":
+        return ""
+    lower = raw.lower()
+    if lower.startswith(("javascript:", "vbscript:", "data:")):
+        return ""
+    if lower.startswith(("mailto:", "tel:")):
+        return raw
+
+    cleaned = unwrap_redirect_url(raw)
+    if base_url:
+        cleaned = urljoin(base_url, cleaned)
+        cleaned = unwrap_redirect_url(cleaned)
+    return cleaned
+
+
+def html_to_markdown(soup_node: Tag, base_url: Optional[str] = None) -> str:
     """
     Recursively converts a BeautifulSoup node into structured, clean Markdown.
     Avoids duplicate text, supports tables, code blocks, lists, quotes, and links,
+    resolves relative links to canonical absolute URLs, unwraps Google redirectors,
     and strips noise tags and anchor permalinks.
     """
     def _convert(node) -> str:
@@ -264,8 +312,9 @@ def html_to_markdown(soup_node: Tag) -> str:
             clean_text = child_text.strip()
             if not clean_text or clean_text in ["¶", "#"]:
                 return ""
-            if href and not href.startswith("#"):
-                return f"[{clean_text}]({href})"
+            resolved_href = resolve_and_clean_url(href, base_url=base_url)
+            if resolved_href and not resolved_href.startswith("#"):
+                return f"[{clean_text}]({resolved_href})"
             return clean_text
         elif tag == "li":
             clean_text = child_text.strip()
@@ -278,7 +327,10 @@ def html_to_markdown(soup_node: Tag) -> str:
         elif tag == "table":
             rows = []
             for tr in node.find_all("tr"):
-                cols = [c.get_text().strip().replace("|", "\\|") for c in tr.find_all(["th", "td"])]
+                cols = [
+                    re.sub(r"\s+", " ", _convert(c)).strip().replace("|", "\\|")
+                    for c in tr.find_all(["th", "td"])
+                ]
                 if cols:
                     rows.append(cols)
             if not rows:
@@ -336,6 +388,7 @@ class WebsiteCrawler:
             self.session.cookies.update(cookies)
 
     def _normalize_url(self, url: str) -> str:
+        url = unwrap_redirect_url(url)
         url, _ = urldefrag(url)
         url = url.strip()
         parsed = urlparse(url)
@@ -384,7 +437,14 @@ class WebsiteCrawler:
         if resp.encoding is None or resp.encoding.lower() == "iso-8859-1":
             resp.encoding = resp.apparent_encoding or "utf-8"
 
+        url = unwrap_redirect_url(url)
         soup = BeautifulSoup(resp.text, "html.parser")
+        base_tag = soup.find("base", href=True)
+        page_base_url = (
+            urljoin(url, base_tag["href"].strip())
+            if base_tag and base_tag.get("href", "").strip()
+            else url
+        )
 
         # Extract Title
         title = ""
@@ -419,8 +479,8 @@ class WebsiteCrawler:
         if not main_content:
             return None
 
-        # Convert to clean Markdown
-        markdown_text = html_to_markdown(main_content)
+        # Convert to clean Markdown with all relative links resolved to absolute URLs
+        markdown_text = html_to_markdown(main_content, base_url=page_base_url)
         if len(markdown_text.strip()) < 50:
             return None
 
@@ -444,8 +504,8 @@ class WebsiteCrawler:
 
         links = []
         for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"].strip()
-            if not href or href.startswith(("#", "mailto:", "javascript:", "tel:")):
+            href = unwrap_redirect_url(a_tag["href"].strip())
+            if not href or href.startswith(("#", "mailto:", "javascript:", "tel:", "vbscript:", "data:")):
                 continue
             abs_url = self._normalize_url(urljoin(base_url, href))
             if self._is_valid_url(abs_url):
@@ -495,7 +555,7 @@ class WebsiteCrawler:
                           crawled=len(results), max_pages=self.max_pages)
                     continue
 
-                effective_url = resp.url or url
+                effective_url = unwrap_redirect_url(resp.url or url)
                 page_data = self._extract_page(resp, effective_url)
                 if page_data:
                     results.append(page_data)
@@ -591,7 +651,7 @@ def stage_artifacts(
             f"crawled_at: {page['crawled_at']}\n"
             f"---\n\n"
             f"# {page['title']}\n\n"
-            f"**Source URL:** {page['url']}\n\n"
+            f"**Source URL:** [{page['url']}]({page['url']})\n\n"
             f"{page['content']}\n"
         )
         with open(filepath, "w", encoding="utf-8") as f:
