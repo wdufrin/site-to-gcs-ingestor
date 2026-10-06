@@ -233,18 +233,26 @@ class IngestionWorker:
                     )
 
                 elif kind in ("skipped", "error"):
-                    with JOB_LOCK:
-                        JOBS[self.job_id].setdefault("failed_urls", []).append({
-                            "url": event["url"], "reason": event.get("reason", ""),
-                        })
-                    add_job_log(self.job_id, "WARNING", f"Skipped {event['url']}: {event.get('reason')}")
+                    if event.get("filtered"):
+                        with JOB_LOCK:
+                            JOBS[self.job_id].setdefault("filtered_urls", []).append({
+                                "url": event["url"], "reason": event.get("reason", ""),
+                            })
+                        add_job_log(self.job_id, "INFO", f"Filtered {event['url']}: {event.get('reason')}")
+                    else:
+                        with JOB_LOCK:
+                            JOBS[self.job_id].setdefault("failed_urls", []).append({
+                                "url": event["url"], "reason": event.get("reason", ""),
+                            })
+                        add_job_log(self.job_id, "WARNING", f"Skipped {event['url']}: {event.get('reason')}")
 
                 elif kind == "target_done":
                     level = "WARNING" if event.get("failed") else "SUCCESS"
+                    filtered_note = f", {event.get('filtered', 0)} non-content filtered" if event.get("filtered") else ""
                     add_job_log(
                         self.job_id, level,
                         f"Target '{event['target']}' finished: {event['pages']} pages, "
-                        f"{event.get('failed', 0)} failed/skipped."
+                        f"{event.get('failed', 0)} failed/skipped{filtered_note}."
                     )
 
                 elif kind == "stage":
@@ -264,7 +272,15 @@ class IngestionWorker:
             )
 
             failed = result.get("failed_count", 0)
+            filtered = result.get("filtered_count", 0)
+            short_snippets = result.get("short_snippet_count", 0)
             pages = result["pages_count"]
+
+            if short_snippets > 0:
+                add_job_log(
+                    self.job_id, "WARNING",
+                    f"Detected {short_snippets} document(s) under 200 characters (teaser/snippet-only content in source)."
+                )
 
             if result.get("indexing_error"):
                 # Indexing failed -- the datastore was NOT updated. Do not
@@ -276,6 +292,7 @@ class IngestionWorker:
                     error=result["indexing_error"],
                     metadata_uri=result["metadata_uri"],
                     failed_count=failed,
+                    filtered_count=filtered,
                 )
                 return
 
@@ -311,11 +328,13 @@ class IngestionWorker:
                 metadata_uri=result["metadata_uri"],
                 import_operation=result.get("import_operation"),
                 failed_count=failed,
+                filtered_count=filtered,
                 crawl_complete=result.get("crawl_complete"),
             )
+            filtered_summary = f", {filtered} non-content filtered" if filtered else ""
             add_job_log(
                 self.job_id, "SUCCESS" if not failed else "WARNING",
-                f"Pipeline finished: {pages} page(s) indexed, {failed} failed, "
+                f"Pipeline finished: {pages} page(s) indexed, {failed} failed{filtered_summary}, "
                 f"across {result['targets_count']} target(s)."
             )
 

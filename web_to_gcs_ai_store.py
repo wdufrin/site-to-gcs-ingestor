@@ -94,15 +94,21 @@ def main() -> int:
 
     pages = result["pages_count"]
     failed = result.get("failed_count", 0)
+    filtered = result.get("filtered_count", 0)
+    short_snippets = result.get("short_snippet_count", 0)
 
     print()
-    print(f"Pages indexed : {pages}")
+    print(f"Pages indexed  : {pages}")
+    if filtered:
+        print(f"Pages filtered : {filtered}  (non-content SSO login / 'has moved' placeholders)")
     if failed:
-        print(f"Pages failed  : {failed}  (NOT in the datastore)")
-    print(f"Targets       : {result['targets_count']}")
-    print(f"Metadata      : {result['metadata_uri']}")
+        print(f"Pages failed   : {failed}  (NOT in the datastore)")
+    if short_snippets:
+        print(f"Short snippets : {short_snippets}  (< 200 chars; source may only provide teaser text)")
+    print(f"Targets        : {result['targets_count']}")
+    print(f"Metadata       : {result['metadata_uri']}")
     if result.get("staging_dir"):
-        print(f"Artifacts     : {result['staging_dir']}")
+        print(f"Artifacts      : {result['staging_dir']}")
 
     if not result.get("crawl_complete"):
         print(

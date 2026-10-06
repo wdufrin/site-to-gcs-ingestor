@@ -208,6 +208,255 @@ def _get_client_options(project_id: Optional[str] = None):
 
 
 
+# Build a lookup table mapping both Latin-1 (0x00..0xFF) and Windows-1252 (0x80..0x9F)
+# decoded characters back to their original raw byte value so double-encoded UTF-8
+# sequences (e.g. "thereâ€™s" -> "there’s") can be deterministically reconstructed.
+_MOJIBAKE_CHAR_TO_BYTE: Dict[str, int] = {chr(b): b for b in range(256)}
+for _b in range(0x80, 0xA0):
+    with contextlib.suppress(UnicodeDecodeError):  # Unassigned CP1252 bytes (0x81, 0x8D, 0x8F, 0x90, 0x9D) fall back to Latin-1 C1 chars
+        _MOJIBAKE_CHAR_TO_BYTE[bytes([_b]).decode("cp1252")] = _b
+
+# Regex pattern matching contiguous runs of characters in the 0x80..0xFF / CP1252 range.
+# Known limits: repairs multi-byte UTF-8 sequences misread as CP1252/ISO-8859-1; does not
+# attempt statistical guessing on arbitrary non-Latin encodings.
+_MOJIBAKE_RUN_RE = re.compile(
+    r"[\u0080-\u00ff\u0152\u0153\u0160\u0161\u0178\u017d\u017e\u0192\u02c6\u02dc"
+    r"\u2013\u2014\u2018-\u201a\u201c-\u201e\u2020-\u2022\u2026\u2030\u2039\u203a\u20ac\u2122]{2,}"
+)
+_MOJIBAKE_LEAD_CHARS = ("â", "Ã", "Â")
+
+# Literal placeholder strings emitted by upstream JSON/Solr/CMS templates for missing fields
+_NULL_LITERAL_VALUES = frozenset({"null", "none", "undefined", "nil", "n/a", "nan"})
+
+# Known SSO / Identity Provider hostnames and login endpoint path prefixes
+_SSO_LOGIN_HOSTS = frozenset({
+    "login.microsoftonline.com",
+    "login.windows.net",
+    "login.live.com",
+    "login.microsoft.com",
+    "autologon.microsoftazuread-sso.com",
+    "device.login.microsoftonline.com",
+    "accounts.google.com",
+})
+_SSO_LOGIN_PATH_PREFIXES = (
+    "/oauth2/authorize",
+    "/oauth2/v1/authorize",
+    "/oauth2/v2.0/authorize",
+    "/saml2/idp",
+    "/idp/sso.saml2",
+    "/adfs/ls",
+    "/_layouts/15/authenticate.aspx",
+)
+
+# Regex Pattern Matching for non-content SSO login screens and "page has moved" tombstones.
+# Known limits: regex checks title and body phrasing combined with character-length bounds
+# (< 1500 chars for title matches, < 1000 chars for body matches) so full-length articles
+# that casually mention something moved are not falsely excluded.
+_SSO_TITLE_RE = re.compile(
+    r"^\s*(?:sign in to your account|sign in to microsoft|sign in\s*-\s*google accounts|microsoft\s+sign\s+in)\s*$",
+    re.IGNORECASE,
+)
+_HAS_MOVED_TITLE_RE = re.compile(
+    r"\b(?:has moved|page moved|site moved|redirect notice)\b",
+    re.IGNORECASE,
+)
+_HAS_MOVED_BODY_RE = re.compile(
+    r"(?:"
+    r"\bthis (?:page|site|content|document|link|tool|application|portal|workspace|resource) has moved\b"
+    r"|\b(?:page|site|content) has moved(?:\s+to\b|[.,!:])"
+    r"|\b(?:please\s+)?update your bookmarks?\b"
+    r"|\b(?:please\s+)?bookmark the new (?:page|url|site|link|address)\b"
+    r"|\bredirect notice\b.*\bredirecting\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def fix_mojibake(text: str) -> str:
+    """
+    Repairs UTF-8 text that was decoded as Windows-1252 or ISO-8859-1 (e.g.
+    turning "thereâ€™s" back into "there’s", "â€œ" into "“", "â€”" into "—",
+    and "Ã©" into "é"). Leaves already-valid Unicode strings untouched.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    # Repair hybrid replacement where 0x9D in UTF-8 right double quote (\xe2\x80\x9d) became U+FFFD
+    if "â€\ufffd" in text:
+        text = text.replace("â€\ufffd", "”")
+    if not any(lead in text for lead in _MOJIBAKE_LEAD_CHARS):
+        return text
+
+    def _replace_run(match: re.Match) -> str:
+        chunk = match.group(0)
+        try:
+            raw_bytes = bytes(_MOJIBAKE_CHAR_TO_BYTE[ch] for ch in chunk)
+            decoded = raw_bytes.decode("utf-8")
+            return decoded
+        except (KeyError, UnicodeDecodeError):
+            return chunk
+
+    repaired = _MOJIBAKE_RUN_RE.sub(_replace_run, text)
+    # Normalize non-breaking spaces introduced by repaired \xc2\xa0 sequences
+    return repaired.replace("\u00a0", " ")
+
+
+def decode_response_text(resp: requests.Response) -> str:
+    """
+    Decodes an HTTP response body into clean Unicode text without mojibake.
+
+    `requests` defaults `resp.encoding` to ISO-8859-1 whenever a `text/*`
+    Content-Type header omits an explicit `charset`, and `apparent_encoding`
+    frequently misclassifies short UTF-8 texts containing curly quotes as
+    Windows-1252. We therefore try strict UTF-8 decoding first unless the server
+    explicitly declared a non-UTF-8, non-ISO-8859-1 charset, and then apply
+    `fix_mojibake` to repair any pre-corrupted upstream strings.
+    """
+    raw_bytes = resp.content
+    if not raw_bytes:
+        return ""
+
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    explicit_charset: Optional[str] = None
+    if "charset=" in content_type:
+        explicit_charset = content_type.split("charset=", 1)[1].split(";")[0].strip().strip("\"'")
+
+    if explicit_charset and explicit_charset not in ("utf-8", "utf8", "iso-8859-1", "latin-1", "latin1"):
+        with contextlib.suppress(LookupError, UnicodeDecodeError):  # Fall back to UTF-8 probe if declared charset fails
+            return fix_mojibake(raw_bytes.decode(explicit_charset))
+
+    try:
+        resp.encoding = "utf-8"
+        return fix_mojibake(raw_bytes.decode("utf-8"))
+    except UnicodeDecodeError:
+        fallback_enc = resp.apparent_encoding or "cp1252"
+        resp.encoding = fallback_enc
+        return fix_mojibake(raw_bytes.decode(fallback_enc, errors="replace"))
+
+
+def sanitize_metadata_value(value: Optional[object]) -> str:
+    """
+    Normalizes a metadata field (title, description, author, target_name):
+    - Unwraps single/multi-valued lists (common in Solr JSON responses).
+    - Repairs UTF-8 mojibake (e.g. "thereâ€™s" -> "there’s").
+    - Drops literal placeholder strings such as "null", "None", "undefined", or "N/A".
+    - Collapses internal whitespace/newlines.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        cleaned_items = [sanitize_metadata_value(v) for v in value]
+        cleaned_items = [v for v in cleaned_items if v]
+        return " ".join(cleaned_items).strip()
+
+    text = fix_mojibake(str(value)).strip()
+    if not text or text.lower() in _NULL_LITERAL_VALUES:
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_sso_or_login_url(url: str) -> Optional[str]:
+    """
+    Returns a rejection reason if `url` points to an SSO / identity provider
+    login endpoint (such as `login.microsoftonline.com`), or None otherwise.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower().split(":")[0]
+    path_lower = parsed.path.lower()
+
+    if host in _SSO_LOGIN_HOSTS or host.endswith(".microsoftonline.com"):
+        return f"SSO login URL ({host})"
+    if any(path_lower.startswith(prefix) for prefix in _SSO_LOGIN_PATH_PREFIXES):
+        return f"authentication endpoint URL ({parsed.path})"
+    return None
+
+
+def detect_non_content_page(
+    url: str,
+    title: str = "",
+    content: str = "",
+    description: str = "",
+) -> Optional[str]:
+    """
+    Uses Regex Pattern Matching and URL host/path checks to identify non-content
+    records that should be excluded from the search datastore:
+      1. Microsoft Entra / SSO "Sign in to your account" login pages
+         (e.g. `login.microsoftonline.com` authorize links).
+      2. Intranet tombstone / placeholder pages whose title or body states that
+         "This page has moved / update your bookmark" (e.g. "Leave of Absence has moved",
+         "Leader Workspace has moved").
+
+    Returns a human-readable reason string when the page is non-content, or None
+    when the page should be kept.
+    """
+    url_reason = is_sso_or_login_url(url)
+    if url_reason:
+        return url_reason
+
+    clean_title = sanitize_metadata_value(title)
+    clean_desc = sanitize_metadata_value(description)
+    clean_content = fix_mojibake(content or "").strip()
+
+    # Strip leading Markdown H1 title + "**Source URL:** ..." boilerplate if present
+    body_only = re.sub(r"^#\s+[^\n]+\n+", "", clean_content).strip()
+    body_only = re.sub(r"^\*\*Source URL:\*\*\s+[^\n]+\n*", "", body_only).strip()
+
+    if _SSO_TITLE_RE.match(clean_title):
+        return f"SSO login page (title='{clean_title}')"
+    if len(body_only) < 600 and "sign in to your account" in body_only.lower():
+        return "SSO login page ('Sign in to your account')"
+
+    combined_short_text = f"{clean_title}\n{clean_desc}\n{body_only}".strip()
+
+    if _HAS_MOVED_TITLE_RE.search(clean_title):
+        if len(body_only) < 1500 or _HAS_MOVED_BODY_RE.search(combined_short_text):
+            return f"redirect/tombstone placeholder (title='{clean_title}')"
+
+    if len(body_only) < 1000 and _HAS_MOVED_BODY_RE.search(combined_short_text):
+        return "redirect/tombstone placeholder ('page has moved / update your bookmark')"
+
+    return None
+
+
+def resolve_citation_url(
+    record_or_url: object,
+    fallback_url: str = "",
+    url_field: Optional[str] = None,
+) -> str:
+    """
+    Resolves the canonical citation URL for a crawled page or search-index record.
+    For search-index records (such as GM One News in Solr), prioritizes explicit
+    `url_field` or `ITS_URL` (the full-article URL) over teaser/split URLs.
+    """
+    candidate = ""
+    if isinstance(record_or_url, dict):
+        field_order: List[str] = []
+        if url_field:
+            field_order.append(url_field)
+        for key in ("ITS_URL", "its_url", "canonical_url", "url", "uri", "link"):
+            if key not in field_order:
+                field_order.append(key)
+        for key in field_order:
+            val = record_or_url.get(key)
+            if isinstance(val, list):
+                val = next((v for v in val if v and str(v).strip().lower() not in _NULL_LITERAL_VALUES), "")
+            if val is not None:
+                val_str = str(val).strip()
+                if val_str and val_str.lower() not in _NULL_LITERAL_VALUES:
+                    candidate = val_str
+                    break
+    elif isinstance(record_or_url, str):
+        candidate = record_or_url.strip()
+
+    if not candidate:
+        candidate = (fallback_url or "").strip()
+
+    resolved = resolve_and_clean_url(candidate, base_url=fallback_url or None)
+    return resolved or unwrap_redirect_url(candidate)
+
+
 def make_doc_id(url: str) -> str:
     """Generates a stable, alphanumeric document ID from a URL."""
     hash_suffix = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
@@ -313,7 +562,7 @@ def html_to_markdown(soup_node: Tag, base_url: Optional[str] = None) -> str:
             if not clean_text or clean_text in ["¶", "#"]:
                 return ""
             resolved_href = resolve_and_clean_url(href, base_url=base_url)
-            if resolved_href and not resolved_href.startswith("#"):
+            if resolved_href and not resolved_href.startswith("#") and not is_sso_or_login_url(resolved_href):
                 return f"[{clean_text}]({resolved_href})"
             return clean_text
         elif tag == "li":
@@ -346,8 +595,8 @@ def html_to_markdown(soup_node: Tag, base_url: Optional[str] = None) -> str:
         return child_text
 
     raw_md = _convert(soup_node)
-    # Collapse multiple blank lines
-    clean_md = re.sub(r"\n{3,}", "\n\n", raw_md).strip()
+    # Collapse multiple blank lines and repair any residual mojibake
+    clean_md = fix_mojibake(re.sub(r"\n{3,}", "\n\n", raw_md).strip())
     return clean_md
 
 
@@ -365,6 +614,8 @@ class WebsiteCrawler:
         target_name: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         cookies: Optional[Dict[str, str]] = None,
+        url_field: Optional[str] = None,
+        max_retries: int = 3,
     ):
         self.base_url = self._normalize_url(base_url)
         parsed = urlparse(self.base_url)
@@ -377,8 +628,12 @@ class WebsiteCrawler:
         self.exclude_patterns = [p.strip() for p in (exclude_patterns or []) if p.strip()]
         self.visited = visited_urls if visited_urls is not None else set()
         self.target_name = target_name or ""
+        self.url_field = url_field
+        self.max_retries = max_retries
         self.failed_urls: List[Dict] = []
+        self.filtered_urls: List[Dict] = []
         self.stats: Dict = {}
+        self._last_skip_reason: Optional[str] = None
 
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self.user_agent})
@@ -399,6 +654,9 @@ class WebsiteCrawler:
     def _is_valid_url(self, url: str) -> bool:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
+            return False
+
+        if is_sso_or_login_url(url):
             return False
 
         netloc = parsed.netloc.lower()
@@ -432,13 +690,139 @@ class WebsiteCrawler:
 
         return True
 
-    def _extract_page(self, resp: requests.Response, url: str) -> Optional[Dict]:
-        # Handle encoding properly to prevent mojibake (e.g. smart quotes turning into â€™)
-        if resp.encoding is None or resp.encoding.lower() == "iso-8859-1":
-            resp.encoding = resp.apparent_encoding or "utf-8"
+    def _fetch_with_retry(self, url: str, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+        """
+        Fetches `url` with exponential backoff on HTTP 429 (API gateway rate limit)
+        and transient 502/503/504 gateway errors.
+        """
+        req_headers = headers or {"Accept": "text/html,application/xhtml+xml,application/json;q=0.9"}
+        last_resp: Optional[requests.Response] = None
+        for attempt in range(self.max_retries + 1):
+            resp = self.session.get(url, timeout=12, headers=req_headers)
+            last_resp = resp
+            if resp.status_code not in (429, 502, 503, 504) or attempt >= self.max_retries:
+                return resp
+
+            retry_after = resp.headers.get("Retry-After", "")
+            if retry_after.isdigit():
+                wait_sec = min(float(retry_after), 30.0)
+            else:
+                wait_sec = min(1.0 * (2 ** attempt), 16.0)
+            logger.warning(
+                f"HTTP {resp.status_code} rate-limit/gateway response on {url}; "
+                f"retrying in {wait_sec:.1f}s (attempt {attempt + 1}/{self.max_retries})"
+            )
+            time.sleep(wait_sec)
+        assert last_resp is not None
+        return last_resp
+
+    def _extract_solr_or_json_docs(self, resp: requests.Response, source_url: str) -> List[Dict]:
+        """
+        Extracts documents from a Solr (`/select?wt=json`) or JSON search index response:
+        - Decodes UTF-8 properly and repairs mojibake ("thereâ€™s" -> "there’s").
+        - Uses `ITS_URL` (or configured `url_field`) for full-article citation URLs.
+        - Drops literal "null" descriptions.
+        - Skips Microsoft SSO (`login.microsoftonline.com`) and "page has moved" placeholders.
+        """
+        text = decode_response_text(resp)
+        payload = json.loads(text)
+        raw_docs: List[Dict] = []
+        if isinstance(payload, dict):
+            if isinstance(payload.get("response"), dict) and isinstance(payload["response"].get("docs"), list):
+                raw_docs = payload["response"]["docs"]
+            elif isinstance(payload.get("docs"), list):
+                raw_docs = payload["docs"]
+            elif isinstance(payload.get("results"), list):
+                raw_docs = payload["results"]
+            elif isinstance(payload.get("items"), list):
+                raw_docs = payload["items"]
+        elif isinstance(payload, list):
+            raw_docs = [d for d in payload if isinstance(d, dict)]
+
+        extracted: List[Dict] = []
+        for raw_doc in raw_docs:
+            if len(extracted) >= self.max_pages:
+                break
+            citation_url = resolve_citation_url(raw_doc, fallback_url=source_url, url_field=self.url_field)
+            title = sanitize_metadata_value(
+                raw_doc.get("title")
+                or raw_doc.get("ITS_TITLE")
+                or raw_doc.get("name")
+                or raw_doc.get("headline")
+                or citation_url
+            )
+            description = sanitize_metadata_value(
+                raw_doc.get("description")
+                or raw_doc.get("ITS_DESCRIPTION")
+                or raw_doc.get("summary")
+                or raw_doc.get("snippet")
+            )
+            author = sanitize_metadata_value(
+                raw_doc.get("author") or raw_doc.get("ITS_AUTHOR") or raw_doc.get("creator")
+            )
+            raw_body = (
+                raw_doc.get("content")
+                or raw_doc.get("body")
+                or raw_doc.get("text")
+                or raw_doc.get("ITS_BODY")
+                or raw_doc.get("ITS_CONTENT")
+                or description
+                or ""
+            )
+            if isinstance(raw_body, list):
+                raw_body = "\n\n".join(str(x) for x in raw_body if x and str(x).strip().lower() not in _NULL_LITERAL_VALUES)
+            body_text = fix_mojibake(str(raw_body)).strip()
+            if body_text.lower() in _NULL_LITERAL_VALUES:
+                body_text = ""
+
+            # If body_text contains HTML tags, convert to clean Markdown
+            if "<" in body_text and ">" in body_text:
+                soup_frag = BeautifulSoup(body_text, "html.parser")
+                body_text = html_to_markdown(soup_frag, base_url=citation_url)
+
+            if not body_text and description:
+                body_text = description
+
+            non_content_reason = detect_non_content_page(
+                url=citation_url,
+                title=title,
+                content=body_text,
+                description=description,
+            )
+            if non_content_reason:
+                self.filtered_urls.append({"url": citation_url, "reason": f"skipped non-content record: {non_content_reason}"})
+                logger.info(f"Skipped index record '{title}' ({citation_url}): {non_content_reason}")
+                continue
+
+            if not body_text:
+                self.filtered_urls.append({"url": citation_url, "reason": "empty index record body"})
+                continue
+
+            doc_id = make_doc_id(citation_url)
+            extracted.append({
+                "id": doc_id,
+                "url": citation_url,
+                "title": title or citation_url,
+                "description": description,
+                "author": author,
+                "content": body_text,
+                "word_count": len(body_text.split()),
+                "crawled_at": datetime.now(timezone.utc).isoformat(),
+                "target_name": self.target_name,
+            })
+        return extracted
+
+    def _extract_page(self, resp: requests.Response, url: str, html_text: Optional[str] = None) -> Optional[Dict]:
+        self._last_skip_reason = None
+        decoded_html = html_text if html_text is not None else decode_response_text(resp)
 
         url = unwrap_redirect_url(url)
-        soup = BeautifulSoup(resp.text, "html.parser")
+        sso_reason = is_sso_or_login_url(url)
+        if sso_reason:
+            self._last_skip_reason = f"skipped non-content page: {sso_reason}"
+            return None
+
+        soup = BeautifulSoup(decoded_html, "html.parser")
         base_tag = soup.find("base", href=True)
         page_base_url = (
             urljoin(url, base_tag["href"].strip())
@@ -446,26 +830,47 @@ class WebsiteCrawler:
             else url
         )
 
+        # Check for canonical or ITS_URL meta/link so teaser URLs (e.g. news.splite.html)
+        # cite the full article URL (e.g. news.detail.html / ITS_URL) when present.
+        canonical_candidate = ""
+        its_meta = soup.find("meta", attrs={"name": re.compile(r"^its_url$", re.I)}) or soup.find(
+            "meta", attrs={"property": re.compile(r"^its_url$", re.I)}
+        )
+        if its_meta and its_meta.get("content"):
+            canonical_candidate = its_meta["content"].strip()
+        elif ".splite." in url.lower():
+            canon_link = soup.find("link", rel=lambda r: r and "canonical" in (r if isinstance(r, list) else [r]))
+            if canon_link and canon_link.get("href"):
+                canonical_candidate = canon_link["href"].strip()
+            else:
+                og_url = soup.find("meta", attrs={"property": "og:url"})
+                if og_url and og_url.get("content"):
+                    canonical_candidate = og_url["content"].strip()
+
+        citation_url = resolve_and_clean_url(canonical_candidate, base_url=page_base_url) if canonical_candidate else url
+        if not citation_url or is_sso_or_login_url(citation_url):
+            citation_url = url
+
         # Extract Title
         title = ""
         if soup.title and soup.title.string:
-            title = soup.title.string.strip()
-        elif soup.find("h1"):
-            title = soup.find("h1").get_text().strip()
-        else:
-            title = url
+            title = sanitize_metadata_value(soup.title.string)
+        if not title and soup.find("h1"):
+            title = sanitize_metadata_value(soup.find("h1").get_text())
+        if not title:
+            title = citation_url
 
-        # Extract Meta Description
+        # Extract Meta Description (sanitizing literal "null" / "None" values)
         description = ""
         meta_desc = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
         if meta_desc and meta_desc.get("content"):
-            description = meta_desc["content"].strip()
+            description = sanitize_metadata_value(meta_desc["content"])
 
-        # Extract Author
+        # Extract Author (sanitizing literal "null" / "None" values)
         author = ""
         meta_author = soup.find("meta", attrs={"name": "author"}) or soup.find("meta", attrs={"property": "article:author"})
         if meta_author and meta_author.get("content"):
-            author = meta_author["content"].strip()
+            author = sanitize_metadata_value(meta_author["content"])
 
         # Locate Main Content
         main_content = (
@@ -481,13 +886,25 @@ class WebsiteCrawler:
 
         # Convert to clean Markdown with all relative links resolved to absolute URLs
         markdown_text = html_to_markdown(main_content, base_url=page_base_url)
+
+        # Reject SSO login pages ("Sign in to your account") and "This page has moved" placeholders
+        non_content_reason = detect_non_content_page(
+            url=citation_url,
+            title=title,
+            content=markdown_text,
+            description=description,
+        )
+        if non_content_reason:
+            self._last_skip_reason = f"skipped non-content page: {non_content_reason}"
+            return None
+
         if len(markdown_text.strip()) < 50:
             return None
 
-        doc_id = make_doc_id(url)
+        doc_id = make_doc_id(citation_url)
         return {
             "id": doc_id,
-            "url": url,
+            "url": citation_url,
             "title": title,
             "description": description,
             "author": author,
@@ -514,7 +931,7 @@ class WebsiteCrawler:
 
     def crawl(self, progress_callback: Optional[Callable[[Dict], None]] = None) -> List[Dict]:
         """
-        Breadth-first crawl of the target site.
+        Breadth-first crawl of the target site (or Solr/JSON search index).
 
         progress_callback, if supplied, is invoked once per attempted URL with a
         dict describing the attempt. This exists so UIs can show live progress
@@ -523,7 +940,8 @@ class WebsiteCrawler:
         """
         queue: List[Tuple[str, int]] = [(self.base_url, 0)]
         results: List[Dict] = []
-        self.failed_urls: List[Dict] = []
+        self.failed_urls = []
+        self.filtered_urls = []
 
         def _emit(**event):
             if progress_callback:
@@ -540,11 +958,32 @@ class WebsiteCrawler:
                 continue
             self.visited.add(url)
 
+            sso_url_reason = is_sso_or_login_url(url)
+            if sso_url_reason:
+                reason = f"skipped non-content page: {sso_url_reason}"
+                self.filtered_urls.append({"url": url, "reason": reason})
+                _emit(kind="skipped", url=url, depth=depth, reason=reason,
+                      filtered=True, crawled=len(results), max_pages=self.max_pages)
+                continue
+
             logger.info(f"[{len(results) + 1}/{self.max_pages}] Fetching: {url} (depth={depth})")
 
             try:
-                resp = self.session.get(url, timeout=12, headers={"Accept": "text/html,application/xhtml+xml"})
-                if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
+                resp = self._fetch_with_retry(url)
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+
+                if resp.status_code == 200 and "application/json" in content_type:
+                    json_docs = self._extract_solr_or_json_docs(resp, url)
+                    for doc in json_docs:
+                        if len(results) >= self.max_pages:
+                            break
+                        results.append(doc)
+                        _emit(kind="page", url=doc["url"], depth=depth,
+                              title=doc.get("title", ""), page=doc,
+                              crawled=len(results), max_pages=self.max_pages)
+                    continue
+
+                if resp.status_code != 200 or "text/html" not in content_type:
                     reason = (
                         f"HTTP {resp.status_code}"
                         if resp.status_code != 200
@@ -556,23 +995,33 @@ class WebsiteCrawler:
                     continue
 
                 effective_url = unwrap_redirect_url(resp.url or url)
-                page_data = self._extract_page(resp, effective_url)
+                decoded_html = decode_response_text(resp)
+                page_data = self._extract_page(resp, effective_url, html_text=decoded_html)
                 if page_data:
                     results.append(page_data)
-                    _emit(kind="page", url=effective_url, depth=depth,
+                    _emit(kind="page", url=page_data["url"], depth=depth,
                           title=page_data.get("title", ""), page=page_data,
                           crawled=len(results), max_pages=self.max_pages)
+                elif self._last_skip_reason:
+                    # Intentionally filtered out as an SSO login screen or a "page has moved" placeholder.
+                    # Recorded in filtered_urls (not failed_urls) so FULL reconciliation can purge it.
+                    reason = self._last_skip_reason
+                    self.filtered_urls.append({"url": effective_url, "reason": reason})
+                    logger.info(f"Filtered {effective_url}: {reason}")
+                    _emit(kind="skipped", url=effective_url, depth=depth, reason=reason,
+                          filtered=True, crawled=len(results), max_pages=self.max_pages)
+                    continue
                 else:
                     # _extract_page returns None when too little text was found,
                     # which most often means the page is JavaScript-rendered.
                     reason = "no extractable content (possible JavaScript-rendered page)"
-                    self.failed_urls.append({"url": url, "reason": reason})
+                    self.failed_urls.append({"url": effective_url, "reason": reason})
                     logger.warning(f"Skipped {effective_url}: {reason}")
                     _emit(kind="skipped", url=effective_url, depth=depth, reason=reason,
                           crawled=len(results), max_pages=self.max_pages)
 
                 if depth < self.max_depth:
-                    new_links = self._extract_links(resp.text, effective_url)
+                    new_links = self._extract_links(decoded_html, effective_url)
                     for link in new_links:
                         if link not in self.visited:
                             queue.append((link, depth + 1))
@@ -586,10 +1035,12 @@ class WebsiteCrawler:
 
             time.sleep(self.delay_seconds)
 
+        short_snippet_count = sum(1 for r in results if len((r.get("content") or "").strip()) < 200)
         self.stats = {
             "target": self.target_name,
             "url": self.base_url,
             "pages_crawled": len(results),
+            "short_snippet_count": short_snippet_count,
             "max_pages_budget": self.max_pages,
             "max_depth_limit": self.max_depth,
             "queue_exhausted": len(queue) == 0,
@@ -597,7 +1048,19 @@ class WebsiteCrawler:
             "hit_max_pages_limit": len(results) >= self.max_pages and len(queue) > 0,
             "failed_count": len(self.failed_urls),
             "failed_urls": self.failed_urls[:50],
+            "filtered_count": len(self.filtered_urls),
+            "filtered_urls": self.filtered_urls[:50],
         }
+        if short_snippet_count > 0:
+            logger.warning(
+                f"Target '{self.target_name}' has {short_snippet_count}/{len(results)} document(s) "
+                "under 200 characters (teaser/snippet-only content)."
+            )
+        if self.filtered_urls:
+            logger.info(
+                f"Crawl for '{self.target_name}' filtered out {len(self.filtered_urls)} non-content "
+                "page(s) (SSO login screens or 'page has moved' placeholders)."
+            )
         if self.failed_urls:
             logger.warning(
                 f"Crawl for '{self.target_name}' had {len(self.failed_urls)} failed/skipped URL(s). "
@@ -625,6 +1088,11 @@ def stage_artifacts(
     """
     Saves clean markdown documents with YAML frontmatter and builds metadata.jsonl.
     Schema maps `structData.url` as the live URL for citation grounding.
+    Also enforces final sanitization:
+      - Resolves `ITS_URL` / `canonical_url` if provided on the page dict.
+      - Repairs UTF-8 mojibake ("thereâ€™s" -> "there’s").
+      - Drops literal "null" / "None" descriptions.
+      - Filters out SSO login pages and "page has moved" placeholders.
     """
     out_path = Path(staging_dir)
     docs_dir = out_path / "documents"
@@ -636,23 +1104,41 @@ def stage_artifacts(
     saved_files = []
 
     for page in pages:
-        doc_id = page["id"]
+        citation_url = resolve_citation_url(page, fallback_url=str(page.get("url") or ""))
+        title = sanitize_metadata_value(page.get("title")) or citation_url
+        description = sanitize_metadata_value(page.get("description"))
+        author = sanitize_metadata_value(page.get("author"))
+        target_name = sanitize_metadata_value(page.get("target_name"))
+        content = fix_mojibake(str(page.get("content") or "")).strip()
+        crawled_at = str(page.get("crawled_at") or datetime.now(timezone.utc).isoformat())
+
+        non_content_reason = detect_non_content_page(
+            url=citation_url,
+            title=title,
+            content=content,
+            description=description,
+        )
+        if non_content_reason:
+            logger.warning(f"Filtered non-content document during staging ({citation_url}): {non_content_reason}")
+            continue
+
+        doc_id = page.get("id") or make_doc_id(citation_url)
         filename = f"{doc_id}.md"
         filepath = docs_dir / filename
 
         md_document = (
             f"---\n"
             f"id: {doc_id}\n"
-            f"title: \"{page['title']}\"\n"
-            f"url: {page['url']}\n"
-            f"description: \"{page['description']}\"\n"
-            f"author: \"{page.get('author', '')}\"\n"
-            f"target_name: \"{page.get('target_name', '')}\"\n"
-            f"crawled_at: {page['crawled_at']}\n"
+            f"title: {json.dumps(title, ensure_ascii=False)}\n"
+            f"url: {citation_url}\n"
+            f"description: {json.dumps(description, ensure_ascii=False)}\n"
+            f"author: {json.dumps(author, ensure_ascii=False)}\n"
+            f"target_name: {json.dumps(target_name, ensure_ascii=False)}\n"
+            f"crawled_at: {crawled_at}\n"
             f"---\n\n"
-            f"# {page['title']}\n\n"
-            f"**Source URL:** [{page['url']}]({page['url']})\n\n"
-            f"{page['content']}\n"
+            f"# {title}\n\n"
+            f"**Source URL:** [{citation_url}]({citation_url})\n\n"
+            f"{content}\n"
         )
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(md_document)
@@ -662,23 +1148,23 @@ def stage_artifacts(
         meta_entry = {
             "id": doc_id,
             "structData": {
-                "title": page["title"],
-                "url": page["url"],
-                "description": page["description"],
-                "author": page.get("author", ""),
-                "target_name": page.get("target_name", ""),
-                "crawled_at": page["crawled_at"],
+                "title": title,
+                "url": citation_url,
+                "description": description,
+                "author": author,
+                "target_name": target_name,
+                "crawled_at": crawled_at,
             },
             "content": {
                 "mimeType": "text/markdown",
                 "uri": gcs_uri,
             },
         }
-        metadata_lines.append(json.dumps(meta_entry))
+        metadata_lines.append(json.dumps(meta_entry, ensure_ascii=False))
 
     metadata_path = out_path / "metadata.jsonl"
     with open(metadata_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(metadata_lines) + "\n")
+        f.write("\n".join(metadata_lines) + ("\n" if metadata_lines else ""))
 
     return saved_files, str(metadata_path)
 
@@ -1221,6 +1707,7 @@ def execute_ingestion(
                 auth_header = target.get("auth_header_name", "Authorization")
                 t_headers[auth_header] = os.environ[auth_env]
             t_cookies = dict(target.get("cookies") or {})
+            t_url_field = target.get("url_field") or full_config.get("url_field")
 
             logger.info(f"[{idx}/{len(targets)}] Crawling target '{t_name}': {t_url} (depth={t_max_depth}, max_pages={t_max_pages})")
             _emit(kind="target_start", target=t_name, url=t_url,
@@ -1237,18 +1724,22 @@ def execute_ingestion(
                 target_name=t_name,
                 headers=t_headers,
                 cookies=t_cookies,
+                url_field=t_url_field,
             )
             target_pages = crawler.crawl(progress_callback=progress_callback)
             all_pages.extend(target_pages)
             crawler_stats.append(crawler.stats)
             logger.info(f"Target '{t_name}' completed with {len(target_pages)} valid pages.")
             _emit(kind="target_done", target=t_name, pages=len(target_pages),
-                  failed=crawler.stats.get("failed_count", 0))
+                  failed=crawler.stats.get("failed_count", 0),
+                  filtered=crawler.stats.get("filtered_count", 0))
 
         if not all_pages:
             raise ValueError(f"No pages could be extracted from {len(targets)} target(s).")
 
         total_failed = sum(s.get("failed_count", 0) for s in crawler_stats)
+        total_filtered = sum(s.get("filtered_count", 0) for s in crawler_stats)
+        total_short_snippets = sum(s.get("short_snippet_count", 0) for s in crawler_stats)
         crawl_complete = all(
             s.get("queue_exhausted") and not s.get("failed_count") for s in crawler_stats
         )
@@ -1299,8 +1790,10 @@ def execute_ingestion(
         return {
             "status": "completed" if not indexing_error else "completed_with_errors",
             "targets_count": len(targets),
-            "pages_count": len(all_pages),
+            "pages_count": len(saved_files),
             "failed_count": total_failed,
+            "filtered_count": total_filtered,
+            "short_snippet_count": total_short_snippets,
             "crawl_complete": crawl_complete,
             "reconciliation_mode": reconcile_setting,
             "reconciliation_mode_used": "FULL" if use_full_reconcile else "INCREMENTAL",

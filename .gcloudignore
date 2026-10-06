@@ -10,8 +10,9 @@ output_datastore/
 test_output/
 *.png
 
-# Exclude credentials and environment secrets from cloud deployments
+# Exclude credentials, tests, and environment secrets from cloud deployments
 #!include:.gitignore
 *.jsonl
 *.log
+test_*.py
 
