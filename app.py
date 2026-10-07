@@ -770,12 +770,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <!-- Main Tab Controller: Extracted Docs / Logs / Code & Manual Execution -->
       <div class="glass-card rounded-2xl p-5 shadow-xl">
         <div class="flex items-center justify-between border-b border-slate-800 pb-3 mb-4">
-          <div class="flex space-x-1.5">
+          <div class="flex flex-wrap gap-1.5">
             <button id="tabDocsBtn" onclick="switchMainTab('docs')" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-400 border border-blue-500/30 flex items-center gap-1.5">
               <i data-lucide="file-text" class="w-3.5 h-3.5"></i> Indexed Documents (<span id="docCount">0</span>)
             </button>
             <button id="tabLogsBtn" onclick="switchMainTab('logs')" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5">
               <i data-lucide="terminal" class="w-3.5 h-3.5"></i> Live Logs
+            </button>
+            <button id="tabCloudBtn" onclick="switchMainTab('cloud')" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5">
+              <i data-lucide="server" class="w-3.5 h-3.5"></i> Cloud Run & Scheduler
             </button>
             <button id="tabCodeBtn" onclick="switchMainTab('code')" class="px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5">
               <i data-lucide="code" class="w-3.5 h-3.5"></i> Code, CI/CD & Deployment
@@ -796,6 +799,67 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="tabLogs" class="hidden font-mono text-xs bg-slate-950/80 p-4 rounded-xl border border-slate-900 max-h-96 overflow-y-auto space-y-1.5 text-slate-300">
           <div id="logsConsole" class="space-y-1">
             <div class="text-slate-600">// Real-time pipeline logs will stream here...</div>
+          </div>
+        </div>
+
+        <!-- Tab 4: Cloud Run & Scheduler Live Deployments Manager -->
+        <div id="tabCloud" class="hidden space-y-4 max-h-[520px] overflow-y-auto pr-1">
+          <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-900/70 p-3 rounded-xl border border-slate-800">
+            <div>
+              <div class="text-xs font-bold text-white flex items-center gap-2">
+                <span>Deployed Cloud Scheduler Triggers & Cloud Run Workloads</span>
+                <span id="cloudDeployBadge" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700"> Ready </span>
+              </div>
+              <p class="text-[11px] text-slate-400 mt-0.5">
+                Inspect, pause/resume (disable/enable) scheduled cron jobs, or delete Cloud Run services, functions, and jobs.
+              </p>
+            </div>
+            <div class="flex items-center gap-2">
+              <select id="cloudRegionSelect" onchange="fetchCloudDeployments()" class="glass-input rounded-lg px-2.5 py-1.5 text-xs text-slate-200 font-mono">
+                <option value="us-central1" selected>us-central1</option>
+                <option value="us-east1">us-east1</option>
+                <option value="us-west1">us-west1</option>
+                <option value="europe-west1">europe-west1</option>
+              </select>
+              <button type="button" onclick="fetchCloudDeployments()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white transition flex items-center gap-1.5">
+                <i data-lucide="refresh-cw" id="refreshCloudIcon" class="w-3.5 h-3.5"></i> Refresh
+              </button>
+            </div>
+          </div>
+
+          <div id="cloudActionFeedback" class="hidden text-xs p-2.5 rounded-xl border"></div>
+
+          <!-- 1. Cloud Scheduler Cron Jobs -->
+          <div class="space-y-2">
+            <div class="text-xs font-bold uppercase tracking-wider text-indigo-400 flex items-center justify-between">
+              <span>1. Cloud Scheduler Jobs (Pause / Resume / Delete)</span>
+              <span id="schedCountLabel" class="text-[11px] font-mono text-slate-400">0 jobs</span>
+            </div>
+            <div id="schedulerJobsList" class="space-y-2 text-xs text-slate-400">
+              Click Refresh to load Cloud Scheduler jobs...
+            </div>
+          </div>
+
+          <!-- 2. Cloud Run Jobs -->
+          <div class="space-y-2 pt-2 border-t border-slate-800/80">
+            <div class="text-xs font-bold uppercase tracking-wider text-amber-400 flex items-center justify-between">
+              <span>2. Cloud Run Jobs</span>
+              <span id="runJobsCountLabel" class="text-[11px] font-mono text-slate-400">0 jobs</span>
+            </div>
+            <div id="cloudRunJobsList" class="space-y-2 text-xs text-slate-400">
+              Click Refresh to load Cloud Run jobs...
+            </div>
+          </div>
+
+          <!-- 3. Cloud Run Services / Gen2 Functions -->
+          <div class="space-y-2 pt-2 border-t border-slate-800/80">
+            <div class="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center justify-between">
+              <span>3. Cloud Run Services & Functions (2nd Gen)</span>
+              <span id="runServicesCountLabel" class="text-[11px] font-mono text-slate-400">0 services</span>
+            </div>
+            <div id="cloudRunServicesList" class="space-y-2 text-xs text-slate-400">
+              Click Refresh to load Cloud Run services...
+            </div>
           </div>
         </div>
 
@@ -1251,18 +1315,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     function switchMainTab(tab) {
       document.getElementById('tabDocs').classList.toggle('hidden', tab !== 'docs');
       document.getElementById('tabLogs').classList.toggle('hidden', tab !== 'logs');
+      document.getElementById('tabCloud').classList.toggle('hidden', tab !== 'cloud');
       document.getElementById('tabCode').classList.toggle('hidden', tab !== 'code');
 
       const bDocs = document.getElementById('tabDocsBtn');
       const bLogs = document.getElementById('tabLogsBtn');
+      const bCloud = document.getElementById('tabCloudBtn');
       const bCode = document.getElementById('tabCodeBtn');
 
-      bDocs.className = tab === 'docs' ? 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-400 border border-blue-500/30 flex items-center gap-1.5' : 'px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5';
-      bLogs.className = tab === 'logs' ? 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-400 border border-blue-500/30 flex items-center gap-1.5' : 'px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5';
-      bCode.className = tab === 'code' ? 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-400 border border-blue-500/30 flex items-center gap-1.5' : 'px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5';
+      const activeCls = 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-400 border border-blue-500/30 flex items-center gap-1.5';
+      const inactiveCls = 'px-3 py-1.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1.5';
+
+      bDocs.className = tab === 'docs' ? activeCls : inactiveCls;
+      bLogs.className = tab === 'logs' ? activeCls : inactiveCls;
+      bCloud.className = tab === 'cloud' ? activeCls : inactiveCls;
+      bCode.className = tab === 'code' ? activeCls : inactiveCls;
 
       if (tab === 'code') {
         updateDynamicSnippets();
+      } else if (tab === 'cloud') {
+        fetchCloudDeployments();
       }
       lucide.createIcons();
     }
@@ -1744,6 +1816,213 @@ curl -X POST "$FUNCTION_URI" \\
       }
     }
 
+    function escapeHtml(str) {
+      return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function showCloudFeedback(message, isError = false) {
+      const el = document.getElementById('cloudActionFeedback');
+      if (!el) return;
+      el.classList.remove('hidden');
+      el.className = isError
+        ? 'text-xs p-2.5 rounded-xl border bg-rose-950/60 border-rose-500/40 text-rose-300 font-mono'
+        : 'text-xs p-2.5 rounded-xl border bg-emerald-950/60 border-emerald-500/40 text-emerald-300 font-mono';
+      el.innerText = message;
+    }
+
+    async function fetchCloudDeployments() {
+      const project = (document.getElementById('project_id')?.value || '').trim();
+      const region = (document.getElementById('cloudRegionSelect')?.value || 'us-central1').trim();
+      const badge = document.getElementById('cloudDeployBadge');
+      const icon = document.getElementById('refreshCloudIcon');
+
+      if (!project) {
+        showCloudFeedback('Enter a GCP Project ID in settings to list deployed Cloud Run & Scheduler resources.', true);
+        return;
+      }
+
+      if (icon) icon.classList.add('animate-spin');
+      if (badge) {
+        badge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 border border-blue-500/40 animate-pulse';
+        badge.innerText = `Scanning ${project}...`;
+      }
+
+      try {
+        const q = new URLSearchParams({ project_id: project, region: region });
+        const resp = await fetch(`/api/cloud/deployments?${q.toString()}`);
+        const data = await resp.json();
+
+        if (!resp.ok || data.error) {
+          throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+
+        const schedJobs = data.scheduler_jobs || [];
+        const runJobs = data.cloud_run_jobs || [];
+        const runServices = data.cloud_run_services || [];
+
+        document.getElementById('schedCountLabel').innerText = `${schedJobs.length} job(s) in ${region}`;
+        document.getElementById('runJobsCountLabel').innerText = `${runJobs.length} job(s)`;
+        document.getElementById('runServicesCountLabel').innerText = `${runServices.length} service(s)`;
+
+        if (badge) {
+          badge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40';
+          badge.innerText = `${project} (${region})`;
+        }
+
+        // 1. Render Cloud Scheduler Jobs
+        const schedEl = document.getElementById('schedulerJobsList');
+        if (schedJobs.length === 0) {
+          schedEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Cloud Scheduler jobs found in ${escapeHtml(region)}.</div>`;
+        } else {
+          schedEl.innerHTML = schedJobs.map(j => {
+            const isEnabled = j.state === 'ENABLED';
+            const isIngestor = j.name.includes('ingestor') || (j.target_uri || '').includes('ingestor');
+            const stateBadge = isEnabled
+              ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">ENABLED</span>'
+              : '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">PAUSED</span>';
+            const toggleAction = isEnabled ? 'pause_scheduler' : 'resume_scheduler';
+            const toggleLabel = isEnabled ? 'Disable (Pause)' : 'Enable (Resume)';
+            const toggleBtnCls = isEnabled
+              ? 'px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 transition'
+              : 'px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 transition';
+
+            return `
+              <div class="p-3 rounded-xl bg-slate-900/80 border ${isIngestor ? 'border-blue-500/40 bg-blue-950/15' : 'border-slate-800'} flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="font-bold text-xs text-white font-mono">${escapeHtml(j.name)}</span>
+                    ${isIngestor ? '<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR</span>' : ''}
+                    ${stateBadge}
+                    <span class="text-[11px] font-mono text-indigo-300">${escapeHtml(j.schedule)}</span>
+                  </div>
+                  <div class="text-[11px] text-slate-400 font-mono truncate mt-0.5">Target: ${escapeHtml(j.target_uri || '—')}</div>
+                  <div class="text-[10px] text-slate-500 mt-0.5">Last run: ${escapeHtml(formatIsoTime(j.last_attempt_time))}</div>
+                </div>
+                <div class="flex items-center gap-1.5 shrink-0">
+                  <button type="button" onclick="manageCloudResource('${toggleAction}', '${escapeHtml(j.name)}', '${escapeHtml(j.region)}')" class="${toggleBtnCls}">
+                    ${toggleLabel}
+                  </button>
+                  <button type="button" onclick="manageCloudResource('delete_scheduler', '${escapeHtml(j.name)}', '${escapeHtml(j.region)}')" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 transition">
+                    Delete
+                  </button>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+
+        // 2. Render Cloud Run Jobs
+        const runJobsEl = document.getElementById('cloudRunJobsList');
+        if (runJobs.length === 0) {
+          runJobsEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Cloud Run Jobs found in project.</div>`;
+        } else {
+          runJobsEl.innerHTML = runJobs.map(j => `
+            <div class="p-3 rounded-xl bg-slate-900/80 border border-slate-800 flex flex-wrap items-center justify-between gap-2">
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2">
+                  <span class="font-bold text-xs text-white font-mono">${escapeHtml(j.name)}</span>
+                  <span class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-800 text-slate-300">${escapeHtml(j.region)}</span>
+                </div>
+                <div class="text-[10px] text-slate-400 mt-0.5">
+                  Latest execution: <span class="font-mono text-slate-300">${escapeHtml(j.latest_execution || 'none')}</span>
+                  • Completed: ${escapeHtml(formatIsoTime(j.completion_time))}
+                </div>
+              </div>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button type="button" onclick="manageCloudResource('delete_run_job', '${escapeHtml(j.name)}', '${escapeHtml(j.region)}')" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 transition">
+                  Delete Job
+                </button>
+              </div>
+            </div>
+          `).join('');
+        }
+
+        // 3. Render Cloud Run Services / Gen2 Functions
+        const runServicesEl = document.getElementById('cloudRunServicesList');
+        if (runServices.length === 0) {
+          runServicesEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Cloud Run Services found in project.</div>`;
+        } else {
+          runServicesEl.innerHTML = runServices.map(s => {
+            const isIngestor = s.name.includes('ingestor');
+            return `
+              <div class="p-3 rounded-xl bg-slate-900/80 border ${isIngestor ? 'border-blue-500/40 bg-blue-950/15' : 'border-slate-800'} flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="font-bold text-xs text-white font-mono">${escapeHtml(s.name)}</span>
+                    ${isIngestor ? '<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR FUNCTION</span>' : ''}
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-800 text-slate-300">${escapeHtml(s.region)}</span>
+                  </div>
+                  <div class="text-[11px] text-blue-400 font-mono truncate mt-0.5">${escapeHtml(s.url || '—')}</div>
+                  <div class="text-[10px] text-slate-500 mt-0.5">Creator: ${escapeHtml(s.creator || '—')}</div>
+                </div>
+                <div class="flex items-center gap-1.5 shrink-0">
+                  <button type="button" onclick="manageCloudResource('delete_run_service', '${escapeHtml(s.name)}', '${escapeHtml(s.region)}')" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 transition">
+                    Delete Service
+                  </button>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+      } catch (err) {
+        showCloudFeedback(`Error loading deployments: ${err.message || err}`, true);
+        if (badge) {
+          badge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/40';
+          badge.innerText = 'Error';
+        }
+      } finally {
+        if (icon) icon.classList.remove('animate-spin');
+      }
+    }
+
+    async function manageCloudResource(action, name, region) {
+      const project = (document.getElementById('project_id')?.value || '').trim();
+      if (!project) {
+        alert('Please enter a GCP Project ID first.');
+        return;
+      }
+
+      const isDelete = action.startsWith('delete_');
+      const actionLabel = {
+        pause_scheduler: `PAUSE (disable) Cloud Scheduler job '${name}'`,
+        resume_scheduler: `RESUME (enable) Cloud Scheduler job '${name}'`,
+        delete_scheduler: `PERMANENTLY DELETE Cloud Scheduler job '${name}'`,
+        delete_run_service: `PERMANENTLY DELETE Cloud Run service/function '${name}'`,
+        delete_run_job: `PERMANENTLY DELETE Cloud Run job '${name}'`,
+      }[action] || `${action} on '${name}'`;
+
+      if (isDelete && !confirm(`Are you sure you want to ${actionLabel} in ${project} (${region})? This cannot be undone.`)) {
+        return;
+      }
+
+      showCloudFeedback(`Executing: ${actionLabel}...`, false);
+      try {
+        const resp = await fetch('/api/cloud/manage-deployment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            project_id: project,
+            region: region,
+            action: action,
+            name: name,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || data.status === 'error') {
+          throw new Error(data.message || data.error || `HTTP ${resp.status}`);
+        }
+        showCloudFeedback(data.message || `Successfully completed ${action} on '${name}'.`, false);
+        await fetchCloudDeployments();
+      } catch (err) {
+        showCloudFeedback(`Action failed: ${err.message || err}`, true);
+      }
+    }
+
     // Attach auto-refresh when project or datastore inputs change
     ['project_id', 'location', 'data_store_id'].forEach(id => {
       const el = document.getElementById(id);
@@ -1758,6 +2037,129 @@ curl -X POST "$FUNCTION_URI" \\
 </body>
 </html>
 """
+
+
+_SAFE_GCP_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _validate_gcp_identifier(value: str, label: str) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned or not _SAFE_GCP_ID_RE.match(cleaned):
+        raise ValueError(f"Invalid {label}: '{value}'. Only alphanumeric characters, hyphens, and underscores are allowed.")
+    return cleaned
+
+
+def list_cloud_deployments(project_id: str, region: str = "us-central1") -> Dict:
+    """
+    Lists deployed Cloud Scheduler jobs, Cloud Run services (including Gen2
+    Cloud Run Functions), and Cloud Run jobs in the specified project.
+    """
+    proj = _validate_gcp_identifier(project_id, "project_id")
+    reg = _validate_gcp_identifier(region, "region")
+
+    # 1. Cloud Scheduler jobs in region
+    scheduler_jobs: List[Dict] = []
+    sched_res = subprocess.run(
+        ["gcloud", "scheduler", "jobs", "list", f"--location={reg}", f"--project={proj}", "--format=json", "--quiet"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    if sched_res.returncode == 0 and sched_res.stdout.strip():
+        for item in json.loads(sched_res.stdout):
+            full_name = item.get("name", "")
+            short_name = full_name.split("/")[-1] if "/" in full_name else full_name
+            scheduler_jobs.append({
+                "name": short_name,
+                "region": reg,
+                "schedule": item.get("schedule", ""),
+                "state": item.get("state", "UNKNOWN"),
+                "target_uri": (item.get("httpTarget") or {}).get("uri", ""),
+                "last_attempt_time": item.get("lastAttemptTime"),
+                "schedule_time": item.get("scheduleTime"),
+            })
+    scheduler_jobs.sort(key=lambda j: (0 if "ingestor" in j["name"] else 1, j["name"]))
+
+    # 2. Cloud Run Services (includes 2nd Gen Cloud Run Functions)
+    cloud_run_services: List[Dict] = []
+    svc_res = subprocess.run(
+        ["gcloud", "run", "services", "list", f"--project={proj}", "--format=json", "--quiet"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    if svc_res.returncode == 0 and svc_res.stdout.strip():
+        for item in json.loads(svc_res.stdout):
+            meta = item.get("metadata") or {}
+            annotations = meta.get("annotations") or {}
+            labels = meta.get("labels") or {}
+            status = item.get("status") or {}
+            name = meta.get("name", "")
+            svc_region = labels.get("cloud.googleapis.com/location", reg)
+            cloud_run_services.append({
+                "name": name,
+                "region": svc_region,
+                "url": status.get("url", ""),
+                "creator": annotations.get("serving.knative.dev/creator", ""),
+            })
+    cloud_run_services.sort(key=lambda s: (0 if "ingestor" in s["name"] else 1, s["name"]))
+
+    # 3. Cloud Run Jobs
+    cloud_run_jobs: List[Dict] = []
+    jobs_res = subprocess.run(
+        ["gcloud", "run", "jobs", "list", f"--project={proj}", "--format=json", "--quiet"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    if jobs_res.returncode == 0 and jobs_res.stdout.strip():
+        for item in json.loads(jobs_res.stdout):
+            meta = item.get("metadata") or {}
+            labels = meta.get("labels") or {}
+            status = item.get("status") or {}
+            latest = status.get("latestCreatedExecution") or {}
+            cloud_run_jobs.append({
+                "name": meta.get("name", ""),
+                "region": labels.get("cloud.googleapis.com/location", reg),
+                "latest_execution": latest.get("name", ""),
+                "completion_time": latest.get("completionTime"),
+            })
+
+    return {
+        "project_id": proj,
+        "region": reg,
+        "scheduler_jobs": scheduler_jobs,
+        "cloud_run_services": cloud_run_services,
+        "cloud_run_jobs": cloud_run_jobs,
+    }
+
+
+def manage_cloud_deployment(payload: Dict) -> Dict:
+    """
+    Executes pause (disable), resume (enable), or delete on a Cloud Scheduler job,
+    Cloud Run service/function, or Cloud Run job after strict identifier validation.
+    """
+    proj = _validate_gcp_identifier(payload.get("project_id") or os.environ.get("GCP_PROJECT", ""), "project_id")
+    reg = _validate_gcp_identifier(payload.get("region", "us-central1"), "region")
+    name = _validate_gcp_identifier(payload.get("name", ""), "resource name")
+    action = (payload.get("action") or "").strip()
+
+    if action == "pause_scheduler":
+        cmd = ["gcloud", "scheduler", "jobs", "pause", name, f"--location={reg}", f"--project={proj}", "--quiet"]
+        desc = f"Paused (disabled) Cloud Scheduler job '{name}' in {reg}."
+    elif action == "resume_scheduler":
+        cmd = ["gcloud", "scheduler", "jobs", "resume", name, f"--location={reg}", f"--project={proj}", "--quiet"]
+        desc = f"Resumed (enabled) Cloud Scheduler job '{name}' in {reg}."
+    elif action == "delete_scheduler":
+        cmd = ["gcloud", "scheduler", "jobs", "delete", name, f"--location={reg}", f"--project={proj}", "--quiet"]
+        desc = f"Deleted Cloud Scheduler job '{name}' in {reg}."
+    elif action == "delete_run_service":
+        cmd = ["gcloud", "run", "services", "delete", name, f"--region={reg}", f"--project={proj}", "--quiet"]
+        desc = f"Deleted Cloud Run service '{name}' in {reg}."
+    elif action == "delete_run_job":
+        cmd = ["gcloud", "run", "jobs", "delete", name, f"--region={reg}", f"--project={proj}", "--quiet"]
+        desc = f"Deleted Cloud Run job '{name}' in {reg}."
+    else:
+        raise ValueError(f"Unsupported action '{action}'.")
+
+    res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=45)
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.strip() or res.stdout.strip() or f"Command exited with {res.returncode}")
+    return {"status": "success", "action": action, "name": name, "region": reg, "message": desc}
 
 
 class IngestServerHandler(SimpleHTTPRequestHandler):
@@ -1844,11 +2246,31 @@ class IngestServerHandler(SimpleHTTPRequestHandler):
                 })
             return
 
+        elif parsed.path == "/api/cloud/deployments":
+            qs = parse_qs(parsed.query)
+            project_id = (qs.get("project_id", [""])[0] or os.environ.get("GCP_PROJECT", "")).strip()
+            region = (qs.get("region", ["us-central1"])[0] or "us-central1").strip()
+            try:
+                data = list_cloud_deployments(project_id, region)
+                self._send_json(data)
+            except Exception as e:
+                self._send_json({"error": str(e), "project_id": project_id, "region": region})
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+
+        if self.path == "/api/cloud/manage-deployment":
+            try:
+                data = json.loads(body)
+                result = manage_cloud_deployment(data)
+                self._send_json(result)
+            except Exception as e:
+                self._send_json({"status": "error", "message": str(e)})
+            return
 
         # 1. Pull Config from GCS
         if self.path == "/api/cloud/pull-config":

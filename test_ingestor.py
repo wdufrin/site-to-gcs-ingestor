@@ -306,5 +306,54 @@ class TestCitationUrlAndSolrIngestion(unittest.TestCase):
                 self.assertEqual(pages[0]["description"], "")
 
 
+class TestCloudDeploymentManagement(unittest.TestCase):
+    def test_rejects_malformed_or_hostile_gcp_identifiers(self):
+        from app import list_cloud_deployments, manage_cloud_deployment
+
+        for hostile in ["proj; rm -rf /", "proj$(whoami)", "../etc/passwd", ""]:
+            with self.assertRaises(ValueError):
+                list_cloud_deployments(hostile, "us-central1")
+            with self.assertRaises(ValueError):
+                manage_cloud_deployment({
+                    "project_id": "valid-proj-123",
+                    "region": "us-central1",
+                    "name": hostile,
+                    "action": "pause_scheduler",
+                })
+
+        with self.assertRaises(ValueError):
+            manage_cloud_deployment({
+                "project_id": "valid-proj-123",
+                "region": "us-central1",
+                "name": "site-ingestor-nightly-sync",
+                "action": "arbitrary_command",
+            })
+
+    def test_pause_resume_and_delete_invokes_expected_gcloud_commands(self):
+        from app import manage_cloud_deployment
+
+        ok_proc = MagicMock(returncode=0, stdout="ok", stderr="")
+        with patch("app.subprocess.run", return_value=ok_proc) as mock_run:
+            res = manage_cloud_deployment({
+                "project_id": "ancient-sandbox-322523",
+                "region": "us-central1",
+                "name": "site-ingestor-nightly-sync",
+                "action": "pause_scheduler",
+            })
+            self.assertEqual(res["status"], "success")
+            cmd = mock_run.call_args[0][0]
+            self.assertEqual(
+                cmd,
+                [
+                    "gcloud", "scheduler", "jobs", "pause",
+                    "site-ingestor-nightly-sync",
+                    "--location=us-central1",
+                    "--project=ancient-sandbox-322523",
+                    "--quiet",
+                ],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
+
