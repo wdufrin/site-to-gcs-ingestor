@@ -353,6 +353,132 @@ class TestCloudDeploymentManagement(unittest.TestCase):
                 ],
             )
 
+    def test_list_cloud_deployments_filters_only_ingestor_workloads(self):
+        from app import list_cloud_deployments
+
+        fake_services = [
+            {
+                "metadata": {
+                    "name": "site-datastore-ingestor",
+                    "labels": {"cloud.googleapis.com/location": "us-central1"},
+                    "annotations": {"run.googleapis.com/build-function-target": "index_website_handler"},
+                },
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "env": [
+                                        {"name": "DATA_STORE_ID", "value": "web-docs-store"},
+                                        {"name": "CONFIG_URI", "value": "gs://bucket/config.json"},
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "status": {"url": "https://site-datastore-ingestor-abc.a.run.app"},
+            },
+            {
+                "metadata": {
+                    "name": "agentspace-manager",
+                    "labels": {"cloud.googleapis.com/location": "us-central1"},
+                    "annotations": {},
+                },
+                "status": {"url": "https://agentspace-manager-abc.a.run.app"},
+            },
+            {
+                "metadata": {
+                    "name": "custom-crawler-fn",
+                    "labels": {"cloud.googleapis.com/location": "us-central1", "app": "site-to-gcs-ingestor"},
+                    "annotations": {},
+                },
+                "status": {"url": "https://custom-crawler-fn-abc.a.run.app"},
+            },
+        ]
+        fake_sched = [
+            {
+                "name": "projects/p/locations/us-central1/jobs/site-ingestor-nightly-sync",
+                "schedule": "0 2 * * *",
+                "state": "ENABLED",
+                "httpTarget": {"uri": "https://site-datastore-ingestor-abc.a.run.app/"},
+            },
+            {
+                "name": "projects/p/locations/us-central1/jobs/trigger-auto-backup",
+                "schedule": "0 0 1 * *",
+                "state": "ENABLED",
+                "httpTarget": {"uri": "https://auto-backup-abc.a.run.app/"},
+            },
+        ]
+        fake_jobs = [
+            {
+                "metadata": {"name": "group-licensing-us", "labels": {"cloud.googleapis.com/location": "us-central1"}},
+                "status": {},
+            },
+        ]
+
+        side_effects = [
+            MagicMock(returncode=0, stdout=json.dumps(fake_services), stderr=""),
+            MagicMock(returncode=0, stdout=json.dumps(fake_sched), stderr=""),
+            MagicMock(returncode=0, stdout=json.dumps(fake_jobs), stderr=""),
+        ]
+        with patch("app.subprocess.run", side_effect=side_effects):
+            res = list_cloud_deployments("ancient-sandbox-322523", "us-central1")
+            self.assertTrue(res["ingestor_only"])
+            self.assertEqual([s["name"] for s in res["cloud_run_services"]], ["custom-crawler-fn", "site-datastore-ingestor"])
+            self.assertEqual([j["name"] for j in res["scheduler_jobs"]], ["site-ingestor-nightly-sync"])
+            self.assertEqual(res["cloud_run_jobs"], [])
+            self.assertEqual(
+                res["hidden_non_ingestor_counts"],
+                {"cloud_run_services": 1, "scheduler_jobs": 1, "cloud_run_jobs": 1},
+            )
+
+    def test_safety_guardrail_blocks_stopping_or_deleting_non_ingestor_resources(self):
+        from app import manage_cloud_deployment
+
+        non_ingestor_svc_desc = {
+            "metadata": {
+                "name": "agentspace-manager",
+                "labels": {"app": "other-app"},
+                "annotations": {},
+            }
+        }
+        non_ingestor_sched_desc = {
+            "name": "projects/p/locations/us-central1/jobs/trigger-auto-backup",
+            "httpTarget": {"uri": "https://auto-backup-abc.a.run.app/"},
+        }
+
+        # 1. Attempting to delete unrelated Cloud Run service 'agentspace-manager' must be rejected
+        with patch(
+            "app.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=json.dumps(non_ingestor_svc_desc), stderr=""),
+        ) as mock_run:
+            with self.assertRaisesRegex(ValueError, "Safety Guardrail"):
+                manage_cloud_deployment({
+                    "project_id": "ancient-sandbox-322523",
+                    "region": "us-central1",
+                    "name": "agentspace-manager",
+                    "action": "delete_run_service",
+                })
+            # Verify it only ran 'describe', NEVER 'delete'
+            self.assertEqual(mock_run.call_count, 1)
+            self.assertIn("describe", mock_run.call_args[0][0])
+
+        # 2. Attempting to pause unrelated Cloud Scheduler job 'trigger-auto-backup' must be rejected
+        with patch(
+            "app.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=json.dumps(non_ingestor_sched_desc), stderr=""),
+        ) as mock_run:
+            with self.assertRaisesRegex(ValueError, "Safety Guardrail"):
+                manage_cloud_deployment({
+                    "project_id": "ancient-sandbox-322523",
+                    "region": "us-central1",
+                    "name": "trigger-auto-backup",
+                    "action": "pause_scheduler",
+                })
+            self.assertEqual(mock_run.call_count, 1)
+            self.assertIn("describe", mock_run.call_args[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

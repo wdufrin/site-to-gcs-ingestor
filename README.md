@@ -136,6 +136,7 @@ gcloud functions deploy site-datastore-ingestor \
   --entry-point=index_website_handler \
   --memory=2Gi \
   --timeout=1800s \
+  --update-labels=app=site-to-gcs-ingestor \
   --set-env-vars=GCP_PROJECT="my-gcp-project",LOCATION="global",GCS_BUCKET="my-ai-knowledge-bucket",GCS_PREFIX="website_datastore",DATA_STORE_ID="web-docs-store",ENGINE_ID="gemini-assistant-app",TARGETS_CONFIG_URI="gs://my-ai-knowledge-bucket/website_datastore/targets.json"
 ```
 

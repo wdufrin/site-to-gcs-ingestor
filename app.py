@@ -802,16 +802,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Tab 4: Cloud Run & Scheduler Live Deployments Manager -->
+        <!-- Tab 4: Cloud Run & Scheduler Live Deployments Manager (Filtered to Ingestor Only) -->
         <div id="tabCloud" class="hidden space-y-4 max-h-[520px] overflow-y-auto pr-1">
-          <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-900/70 p-3 rounded-xl border border-slate-800">
+          <div class="flex flex-wrap items-center justify-between gap-2 bg-slate-900/70 p-3 rounded-xl border border-blue-500/30">
             <div>
               <div class="text-xs font-bold text-white flex items-center gap-2">
-                <span>Deployed Cloud Scheduler Triggers & Cloud Run Workloads</span>
+                <span>Ingestor Cloud Run Functions & Scheduler Triggers</span>
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/40">🔒 Ingestor Only</span>
                 <span id="cloudDeployBadge" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700"> Ready </span>
               </div>
               <p class="text-[11px] text-slate-400 mt-0.5">
-                Inspect, pause/resume (disable/enable) scheduled cron jobs, or delete Cloud Run services, functions, and jobs.
+                Filtered exclusively to Site-to-GCS Ingestor workloads (<code class="text-blue-300">index_website_handler</code> / <code class="text-blue-300">app=site-to-gcs-ingestor</code>) so other project services cannot be accidentally stopped or deleted.
               </p>
             </div>
             <div class="flex items-center gap-2">
@@ -827,38 +828,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
           </div>
 
+          <div id="cloudSafetyBanner" class="hidden text-[11px] px-3 py-2 rounded-xl bg-slate-900/90 border border-slate-800 text-slate-400 font-mono"></div>
           <div id="cloudActionFeedback" class="hidden text-xs p-2.5 rounded-xl border"></div>
 
-          <!-- 1. Cloud Scheduler Cron Jobs -->
+          <!-- 1. Ingestor Cloud Scheduler Cron Jobs -->
           <div class="space-y-2">
             <div class="text-xs font-bold uppercase tracking-wider text-indigo-400 flex items-center justify-between">
-              <span>1. Cloud Scheduler Jobs (Pause / Resume / Delete)</span>
+              <span>1. Ingestor Cloud Scheduler Triggers (Disable / Enable / Delete)</span>
               <span id="schedCountLabel" class="text-[11px] font-mono text-slate-400">0 jobs</span>
             </div>
             <div id="schedulerJobsList" class="space-y-2 text-xs text-slate-400">
-              Click Refresh to load Cloud Scheduler jobs...
+              Click Refresh to load Ingestor Cloud Scheduler triggers...
             </div>
           </div>
 
-          <!-- 2. Cloud Run Jobs -->
+          <!-- 2. Ingestor Cloud Run Functions (2nd Gen) & Services -->
+          <div class="space-y-2 pt-2 border-t border-slate-800/80">
+            <div class="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center justify-between">
+              <span>2. Ingestor Cloud Run Functions (2nd Gen) & Services</span>
+              <span id="runServicesCountLabel" class="text-[11px] font-mono text-slate-400">0 functions</span>
+            </div>
+            <div id="cloudRunServicesList" class="space-y-2 text-xs text-slate-400">
+              Click Refresh to load Ingestor Cloud Run functions...
+            </div>
+          </div>
+
+          <!-- 3. Ingestor Cloud Run Jobs -->
           <div class="space-y-2 pt-2 border-t border-slate-800/80">
             <div class="text-xs font-bold uppercase tracking-wider text-amber-400 flex items-center justify-between">
-              <span>2. Cloud Run Jobs</span>
+              <span>3. Ingestor Cloud Run Jobs</span>
               <span id="runJobsCountLabel" class="text-[11px] font-mono text-slate-400">0 jobs</span>
             </div>
             <div id="cloudRunJobsList" class="space-y-2 text-xs text-slate-400">
-              Click Refresh to load Cloud Run jobs...
-            </div>
-          </div>
-
-          <!-- 3. Cloud Run Services / Gen2 Functions -->
-          <div class="space-y-2 pt-2 border-t border-slate-800/80">
-            <div class="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center justify-between">
-              <span>3. Cloud Run Services & Functions (2nd Gen)</span>
-              <span id="runServicesCountLabel" class="text-[11px] font-mono text-slate-400">0 services</span>
-            </div>
-            <div id="cloudRunServicesList" class="space-y-2 text-xs text-slate-400">
-              Click Refresh to load Cloud Run services...
+              Click Refresh to load Ingestor Cloud Run jobs...
             </div>
           </div>
         </div>
@@ -1396,6 +1398,7 @@ steps:
       - '--entry-point=index_website_handler'
       - '--memory=2Gi'
       - '--timeout=1800s'
+      - '--update-labels=app=site-to-gcs-ingestor'
       - '--set-env-vars=GCP_PROJECT=$PROJECT_ID,LOCATION=${location},GCS_BUCKET=${bucket},GCS_PREFIX=${prefix},DATA_STORE_ID=${datastore},ENGINE_ID=${engine},CONFIG_URI=${configGcsUri}'
 
   # Step 3: Configure Cloud Scheduler with OIDC
@@ -1435,6 +1438,7 @@ substitutions:
   --entry-point=index_website_handler \\
   --memory=2Gi \\
   --timeout=1800s \\
+  --update-labels=app=site-to-gcs-ingestor \\
   --set-env-vars=GCP_PROJECT="${project}",LOCATION="${location}",GCS_BUCKET="${bucket}",GCS_PREFIX="${prefix}",DATA_STORE_ID="${datastore}",ENGINE_ID="${engine}",CONFIG_URI="${configGcsUri}",RECONCILIATION_MODE="${currentReconcileMode}"`;
       document.getElementById('snippetDeploy').innerText = deployCmd;
 
@@ -1840,6 +1844,7 @@ curl -X POST "$FUNCTION_URI" \\
       const region = (document.getElementById('cloudRegionSelect')?.value || 'us-central1').trim();
       const badge = document.getElementById('cloudDeployBadge');
       const icon = document.getElementById('refreshCloudIcon');
+      const safetyBanner = document.getElementById('cloudSafetyBanner');
 
       if (!project) {
         showCloudFeedback('Enter a GCP Project ID in settings to list deployed Cloud Run & Scheduler resources.', true);
@@ -1864,24 +1869,32 @@ curl -X POST "$FUNCTION_URI" \\
         const schedJobs = data.scheduler_jobs || [];
         const runJobs = data.cloud_run_jobs || [];
         const runServices = data.cloud_run_services || [];
+        const hidden = data.hidden_non_ingestor_counts || {};
 
-        document.getElementById('schedCountLabel').innerText = `${schedJobs.length} job(s) in ${region}`;
-        document.getElementById('runJobsCountLabel').innerText = `${runJobs.length} job(s)`;
-        document.getElementById('runServicesCountLabel').innerText = `${runServices.length} service(s)`;
+        document.getElementById('schedCountLabel').innerText = `${schedJobs.length} ingestor trigger(s) in ${region}`;
+        document.getElementById('runServicesCountLabel').innerText = `${runServices.length} ingestor function(s)`;
+        document.getElementById('runJobsCountLabel').innerText = `${runJobs.length} ingestor job(s)`;
+
+        if (safetyBanner) {
+          const hSvc = hidden.cloud_run_services || 0;
+          const hSched = hidden.scheduler_jobs || 0;
+          const hJobs = hidden.cloud_run_jobs || 0;
+          safetyBanner.classList.remove('hidden');
+          safetyBanner.innerHTML = `🛡️ <span class="text-emerald-400 font-semibold">Safety Filter Active:</span> Showing only identified Ingestor workloads. Hidden &amp; protected from modification: <span class="text-slate-200">${hSvc}</span> other Cloud Run service(s), <span class="text-slate-200">${hSched}</span> scheduler job(s), <span class="text-slate-200">${hJobs}</span> Cloud Run job(s).`;
+        }
 
         if (badge) {
           badge.className = 'text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40';
           badge.innerText = `${project} (${region})`;
         }
 
-        // 1. Render Cloud Scheduler Jobs
+        // 1. Render Ingestor Cloud Scheduler Jobs
         const schedEl = document.getElementById('schedulerJobsList');
         if (schedJobs.length === 0) {
-          schedEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Cloud Scheduler jobs found in ${escapeHtml(region)}.</div>`;
+          schedEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Ingestor Cloud Scheduler triggers found in ${escapeHtml(region)}.</div>`;
         } else {
           schedEl.innerHTML = schedJobs.map(j => {
             const isEnabled = j.state === 'ENABLED';
-            const isIngestor = j.name.includes('ingestor') || (j.target_uri || '').includes('ingestor');
             const stateBadge = isEnabled
               ? '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">ENABLED</span>'
               : '<span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">PAUSED</span>';
@@ -1892,11 +1905,11 @@ curl -X POST "$FUNCTION_URI" \\
               : 'px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 transition';
 
             return `
-              <div class="p-3 rounded-xl bg-slate-900/80 border ${isIngestor ? 'border-blue-500/40 bg-blue-950/15' : 'border-slate-800'} flex flex-wrap items-center justify-between gap-2">
+              <div class="p-3 rounded-xl bg-slate-900/80 border border-blue-500/40 bg-blue-950/15 flex flex-wrap items-center justify-between gap-2">
                 <div class="min-w-0 flex-1">
                   <div class="flex items-center gap-2">
                     <span class="font-bold text-xs text-white font-mono">${escapeHtml(j.name)}</span>
-                    ${isIngestor ? '<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR</span>' : ''}
+                    <span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR TRIGGER</span>
                     ${stateBadge}
                     <span class="text-[11px] font-mono text-indigo-300">${escapeHtml(j.schedule)}</span>
                   </div>
@@ -1916,16 +1929,49 @@ curl -X POST "$FUNCTION_URI" \\
           }).join('');
         }
 
-        // 2. Render Cloud Run Jobs
+        // 2. Render Ingestor Cloud Run Services / Gen2 Functions
+        const runServicesEl = document.getElementById('cloudRunServicesList');
+        if (runServices.length === 0) {
+          runServicesEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Ingestor Cloud Run functions found in project.</div>`;
+        } else {
+          runServicesEl.innerHTML = runServices.map(s => {
+            const metaLine = [
+              s.entrypoint ? `entrypoint: ${s.entrypoint}` : '',
+              s.data_store_id ? `datastore: ${s.data_store_id}` : '',
+              s.config_uri ? `config: ${s.config_uri}` : '',
+            ].filter(Boolean).join(' • ');
+            return `
+              <div class="p-3 rounded-xl bg-slate-900/80 border border-blue-500/40 bg-blue-950/15 flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="font-bold text-xs text-white font-mono">${escapeHtml(s.name)}</span>
+                    <span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR FUNCTION</span>
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-800 text-slate-300">${escapeHtml(s.region)}</span>
+                  </div>
+                  <div class="text-[11px] text-blue-400 font-mono truncate mt-0.5">${escapeHtml(s.url || '—')}</div>
+                  ${metaLine ? `<div class="text-[10px] text-slate-400 font-mono truncate mt-0.5">${escapeHtml(metaLine)}</div>` : ''}
+                </div>
+                <div class="flex items-center gap-1.5 shrink-0">
+                  <button type="button" onclick="manageCloudResource('delete_run_service', '${escapeHtml(s.name)}', '${escapeHtml(s.region)}')" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 transition">
+                    Delete Function
+                  </button>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+
+        // 3. Render Ingestor Cloud Run Jobs
         const runJobsEl = document.getElementById('cloudRunJobsList');
         if (runJobs.length === 0) {
-          runJobsEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Cloud Run Jobs found in project.</div>`;
+          runJobsEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Ingestor Cloud Run Jobs found in project.</div>`;
         } else {
           runJobsEl.innerHTML = runJobs.map(j => `
-            <div class="p-3 rounded-xl bg-slate-900/80 border border-slate-800 flex flex-wrap items-center justify-between gap-2">
+            <div class="p-3 rounded-xl bg-slate-900/80 border border-blue-500/40 bg-blue-950/15 flex flex-wrap items-center justify-between gap-2">
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-2">
                   <span class="font-bold text-xs text-white font-mono">${escapeHtml(j.name)}</span>
+                  <span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR JOB</span>
                   <span class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-800 text-slate-300">${escapeHtml(j.region)}</span>
                 </div>
                 <div class="text-[10px] text-slate-400 mt-0.5">
@@ -1940,34 +1986,6 @@ curl -X POST "$FUNCTION_URI" \\
               </div>
             </div>
           `).join('');
-        }
-
-        // 3. Render Cloud Run Services / Gen2 Functions
-        const runServicesEl = document.getElementById('cloudRunServicesList');
-        if (runServices.length === 0) {
-          runServicesEl.innerHTML = `<div class="p-3 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500">No Cloud Run Services found in project.</div>`;
-        } else {
-          runServicesEl.innerHTML = runServices.map(s => {
-            const isIngestor = s.name.includes('ingestor');
-            return `
-              <div class="p-3 rounded-xl bg-slate-900/80 border ${isIngestor ? 'border-blue-500/40 bg-blue-950/15' : 'border-slate-800'} flex flex-wrap items-center justify-between gap-2">
-                <div class="min-w-0 flex-1">
-                  <div class="flex items-center gap-2">
-                    <span class="font-bold text-xs text-white font-mono">${escapeHtml(s.name)}</span>
-                    ${isIngestor ? '<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-600/30 text-blue-300 border border-blue-500/40">INGESTOR FUNCTION</span>' : ''}
-                    <span class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-800 text-slate-300">${escapeHtml(s.region)}</span>
-                  </div>
-                  <div class="text-[11px] text-blue-400 font-mono truncate mt-0.5">${escapeHtml(s.url || '—')}</div>
-                  <div class="text-[10px] text-slate-500 mt-0.5">Creator: ${escapeHtml(s.creator || '—')}</div>
-                </div>
-                <div class="flex items-center gap-1.5 shrink-0">
-                  <button type="button" onclick="manageCloudResource('delete_run_service', '${escapeHtml(s.name)}', '${escapeHtml(s.region)}')" class="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 transition">
-                    Delete Service
-                  </button>
-                </div>
-              </div>
-            `;
-          }).join('');
         }
       } catch (err) {
         showCloudFeedback(`Error loading deployments: ${err.message || err}`, true);
@@ -1989,11 +2007,11 @@ curl -X POST "$FUNCTION_URI" \\
 
       const isDelete = action.startsWith('delete_');
       const actionLabel = {
-        pause_scheduler: `PAUSE (disable) Cloud Scheduler job '${name}'`,
-        resume_scheduler: `RESUME (enable) Cloud Scheduler job '${name}'`,
-        delete_scheduler: `PERMANENTLY DELETE Cloud Scheduler job '${name}'`,
-        delete_run_service: `PERMANENTLY DELETE Cloud Run service/function '${name}'`,
-        delete_run_job: `PERMANENTLY DELETE Cloud Run job '${name}'`,
+        pause_scheduler: `PAUSE (disable) Ingestor Cloud Scheduler job '${name}'`,
+        resume_scheduler: `RESUME (enable) Ingestor Cloud Scheduler job '${name}'`,
+        delete_scheduler: `PERMANENTLY DELETE Ingestor Cloud Scheduler job '${name}'`,
+        delete_run_service: `PERMANENTLY DELETE Ingestor Cloud Run function '${name}'`,
+        delete_run_job: `PERMANENTLY DELETE Ingestor Cloud Run job '${name}'`,
       }[action] || `${action} on '${name}'`;
 
       if (isDelete && !confirm(`Are you sure you want to ${actionLabel} in ${project} (${region})? This cannot be undone.`)) {
@@ -2040,6 +2058,8 @@ curl -X POST "$FUNCTION_URI" \\
 
 
 _SAFE_GCP_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+INGESTOR_LABEL_VALUES = {"site-to-gcs-ingestor", "site-datastore-ingestor", "site-ingestor"}
+INGESTOR_ENTRYPOINT = "index_website_handler"
 
 
 def _validate_gcp_identifier(value: str, label: str) -> str:
@@ -2049,15 +2069,127 @@ def _validate_gcp_identifier(value: str, label: str) -> str:
     return cleaned
 
 
+def _is_ingestor_service_item(item: Dict) -> bool:
+    """
+    Returns True if a Cloud Run Service / 2nd-Gen Function item belongs to
+    site-to-gcs-ingestor (matched via explicit GCP label, entrypoint annotation,
+    or canonical 'ingestor' naming).
+    """
+    meta = item.get("metadata") or {}
+    name = (meta.get("name") or "").lower()
+    labels = meta.get("labels") or {}
+    annotations = meta.get("annotations") or {}
+
+    if labels.get("app", "").lower() in INGESTOR_LABEL_VALUES:
+        return True
+    if labels.get("managed-by", "").lower() in INGESTOR_LABEL_VALUES:
+        return True
+    if annotations.get("run.googleapis.com/build-function-target") == INGESTOR_ENTRYPOINT:
+        return True
+    if "ingestor" in name:
+        return True
+    return False
+
+
+def _is_ingestor_run_job_item(item: Dict) -> bool:
+    """
+    Returns True if a Cloud Run Job item belongs to site-to-gcs-ingestor.
+    """
+    meta = item.get("metadata") or {}
+    name = (meta.get("name") or "").lower()
+    labels = meta.get("labels") or {}
+    if labels.get("app", "").lower() in INGESTOR_LABEL_VALUES:
+        return True
+    if labels.get("managed-by", "").lower() in INGESTOR_LABEL_VALUES:
+        return True
+    if "ingestor" in name:
+        return True
+    return False
+
+
+def _is_ingestor_scheduler_item(item: Dict, ingestor_urls: List[str], ingestor_names: List[str]) -> bool:
+    """
+    Returns True if a Cloud Scheduler job belongs to site-to-gcs-ingestor
+    (matched by name or by targeting an identified ingestor Cloud Run URL).
+    """
+    full_name = item.get("name") or ""
+    short_name = (full_name.split("/")[-1] if "/" in full_name else full_name).lower()
+    target_uri = ((item.get("httpTarget") or {}).get("uri") or "").lower().rstrip("/")
+
+    if "ingestor" in short_name or "ingestor" in target_uri:
+        return True
+    for u in ingestor_urls:
+        clean_u = (u or "").lower().rstrip("/")
+        if clean_u and (target_uri == clean_u or target_uri.startswith(clean_u + "/")):
+            return True
+    for n in ingestor_names:
+        if n and f"/{n.lower()}" in target_uri:
+            return True
+    return False
+
+
 def list_cloud_deployments(project_id: str, region: str = "us-central1") -> Dict:
     """
-    Lists deployed Cloud Scheduler jobs, Cloud Run services (including Gen2
-    Cloud Run Functions), and Cloud Run jobs in the specified project.
+    Lists deployed Cloud Scheduler triggers, Cloud Run services (2nd Gen
+    Cloud Run Functions), and Cloud Run jobs in the specified project,
+    filtered strictly to site-to-gcs-ingestor workloads so unrelated services
+    cannot be accidentally paused or deleted.
     """
     proj = _validate_gcp_identifier(project_id, "project_id")
     reg = _validate_gcp_identifier(region, "region")
 
-    # 1. Cloud Scheduler jobs in region
+    hidden_counts = {
+        "scheduler_jobs": 0,
+        "cloud_run_services": 0,
+        "cloud_run_jobs": 0,
+    }
+
+    # 1. Cloud Run Services (includes 2nd Gen Cloud Run Functions) — inspect first
+    # so we know all Ingestor URLs/names when filtering Cloud Scheduler jobs.
+    cloud_run_services: List[Dict] = []
+    ingestor_urls: List[str] = []
+    ingestor_names: List[str] = []
+    svc_res = subprocess.run(
+        ["gcloud", "run", "services", "list", f"--project={proj}", "--format=json", "--quiet"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+    )
+    if svc_res.returncode == 0 and svc_res.stdout.strip():
+        for item in json.loads(svc_res.stdout):
+            if not _is_ingestor_service_item(item):
+                hidden_counts["cloud_run_services"] += 1
+                continue
+            meta = item.get("metadata") or {}
+            annotations = meta.get("annotations") or {}
+            labels = meta.get("labels") or {}
+            status = item.get("status") or {}
+            name = meta.get("name", "")
+            svc_region = labels.get("cloud.googleapis.com/location", reg)
+            url = status.get("url", "")
+
+            # Extract env vars from container spec if available
+            env_map: Dict[str, str] = {}
+            containers = (((item.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []
+            if containers and isinstance(containers[0], dict):
+                for env_entry in containers[0].get("env") or []:
+                    if isinstance(env_entry, dict) and env_entry.get("name") and "value" in env_entry:
+                        env_map[env_entry["name"]] = str(env_entry["value"])
+
+            ingestor_names.append(name)
+            if url:
+                ingestor_urls.append(url)
+
+            cloud_run_services.append({
+                "name": name,
+                "region": svc_region,
+                "url": url,
+                "creator": annotations.get("serving.knative.dev/creator", ""),
+                "entrypoint": annotations.get("run.googleapis.com/build-function-target", ""),
+                "data_store_id": env_map.get("DATA_STORE_ID", ""),
+                "config_uri": env_map.get("CONFIG_URI", ""),
+            })
+    cloud_run_services.sort(key=lambda s: s["name"])
+
+    # 2. Cloud Scheduler jobs in region (filtered to Ingestor triggers only)
     scheduler_jobs: List[Dict] = []
     sched_res = subprocess.run(
         ["gcloud", "scheduler", "jobs", "list", f"--location={reg}", f"--project={proj}", "--format=json", "--quiet"],
@@ -2065,6 +2197,9 @@ def list_cloud_deployments(project_id: str, region: str = "us-central1") -> Dict
     )
     if sched_res.returncode == 0 and sched_res.stdout.strip():
         for item in json.loads(sched_res.stdout):
+            if not _is_ingestor_scheduler_item(item, ingestor_urls, ingestor_names):
+                hidden_counts["scheduler_jobs"] += 1
+                continue
             full_name = item.get("name", "")
             short_name = full_name.split("/")[-1] if "/" in full_name else full_name
             scheduler_jobs.append({
@@ -2076,31 +2211,9 @@ def list_cloud_deployments(project_id: str, region: str = "us-central1") -> Dict
                 "last_attempt_time": item.get("lastAttemptTime"),
                 "schedule_time": item.get("scheduleTime"),
             })
-    scheduler_jobs.sort(key=lambda j: (0 if "ingestor" in j["name"] else 1, j["name"]))
+    scheduler_jobs.sort(key=lambda j: j["name"])
 
-    # 2. Cloud Run Services (includes 2nd Gen Cloud Run Functions)
-    cloud_run_services: List[Dict] = []
-    svc_res = subprocess.run(
-        ["gcloud", "run", "services", "list", f"--project={proj}", "--format=json", "--quiet"],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
-    )
-    if svc_res.returncode == 0 and svc_res.stdout.strip():
-        for item in json.loads(svc_res.stdout):
-            meta = item.get("metadata") or {}
-            annotations = meta.get("annotations") or {}
-            labels = meta.get("labels") or {}
-            status = item.get("status") or {}
-            name = meta.get("name", "")
-            svc_region = labels.get("cloud.googleapis.com/location", reg)
-            cloud_run_services.append({
-                "name": name,
-                "region": svc_region,
-                "url": status.get("url", ""),
-                "creator": annotations.get("serving.knative.dev/creator", ""),
-            })
-    cloud_run_services.sort(key=lambda s: (0 if "ingestor" in s["name"] else 1, s["name"]))
-
-    # 3. Cloud Run Jobs
+    # 3. Cloud Run Jobs (filtered to Ingestor jobs only)
     cloud_run_jobs: List[Dict] = []
     jobs_res = subprocess.run(
         ["gcloud", "run", "jobs", "list", f"--project={proj}", "--format=json", "--quiet"],
@@ -2108,6 +2221,9 @@ def list_cloud_deployments(project_id: str, region: str = "us-central1") -> Dict
     )
     if jobs_res.returncode == 0 and jobs_res.stdout.strip():
         for item in json.loads(jobs_res.stdout):
+            if not _is_ingestor_run_job_item(item):
+                hidden_counts["cloud_run_jobs"] += 1
+                continue
             meta = item.get("metadata") or {}
             labels = meta.get("labels") or {}
             status = item.get("status") or {}
@@ -2122,16 +2238,53 @@ def list_cloud_deployments(project_id: str, region: str = "us-central1") -> Dict
     return {
         "project_id": proj,
         "region": reg,
+        "ingestor_only": True,
+        "hidden_non_ingestor_counts": hidden_counts,
         "scheduler_jobs": scheduler_jobs,
         "cloud_run_services": cloud_run_services,
         "cloud_run_jobs": cloud_run_jobs,
     }
 
 
+def _verify_ingestor_resource_target(proj: str, reg: str, action: str, name: str) -> None:
+    """
+    Safety guardrail: verifies that a target resource belongs to site-to-gcs-ingestor
+    before executing any pause, resume, or delete operation. Prevents accidental
+    modification or deletion of unrelated Cloud Run functions/services/jobs.
+    """
+    if "ingestor" in name.lower():
+        return
+
+    if action == "delete_run_service":
+        desc_cmd = ["gcloud", "run", "services", "describe", name, f"--region={reg}", f"--project={proj}", "--format=json", "--quiet"]
+        res = subprocess.run(desc_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            if _is_ingestor_service_item(json.loads(res.stdout)):
+                return
+    elif action == "delete_run_job":
+        desc_cmd = ["gcloud", "run", "jobs", "describe", name, f"--region={reg}", f"--project={proj}", "--format=json", "--quiet"]
+        res = subprocess.run(desc_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            if _is_ingestor_run_job_item(json.loads(res.stdout)):
+                return
+    elif action in ("pause_scheduler", "resume_scheduler", "delete_scheduler"):
+        desc_cmd = ["gcloud", "scheduler", "jobs", "describe", name, f"--location={reg}", f"--project={proj}", "--format=json", "--quiet"]
+        res = subprocess.run(desc_cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            if _is_ingestor_scheduler_item(json.loads(res.stdout), [], []):
+                return
+
+    raise ValueError(
+        f"Safety Guardrail: Refusing to run '{action}' on non-ingestor resource '{name}'. "
+        "Only site-to-gcs-ingestor functions, jobs, and scheduler triggers can be modified."
+    )
+
+
 def manage_cloud_deployment(payload: Dict) -> Dict:
     """
-    Executes pause (disable), resume (enable), or delete on a Cloud Scheduler job,
-    Cloud Run service/function, or Cloud Run job after strict identifier validation.
+    Executes pause (disable), resume (enable), or delete on an identified Ingestor
+    Cloud Scheduler job, Cloud Run service/function, or Cloud Run job after strict
+    identifier validation and Ingestor ownership verification.
     """
     proj = _validate_gcp_identifier(payload.get("project_id") or os.environ.get("GCP_PROJECT", ""), "project_id")
     reg = _validate_gcp_identifier(payload.get("region", "us-central1"), "region")
@@ -2155,6 +2308,8 @@ def manage_cloud_deployment(payload: Dict) -> Dict:
         desc = f"Deleted Cloud Run job '{name}' in {reg}."
     else:
         raise ValueError(f"Unsupported action '{action}'.")
+
+    _verify_ingestor_resource_target(proj, reg, action, name)
 
     res = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=45)
     if res.returncode != 0:

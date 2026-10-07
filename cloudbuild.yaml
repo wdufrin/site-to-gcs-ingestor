@@ -30,6 +30,7 @@ steps:
       - '--entry-point=index_website_handler'
       - '--memory=2Gi'
       - '--timeout=1800s'
+      - '--update-labels=app=site-to-gcs-ingestor'
       - '--set-env-vars=GCP_PROJECT=$PROJECT_ID,LOCATION=$_LOCATION,GCS_BUCKET=$_GCS_BUCKET,GCS_PREFIX=$_GCS_PREFIX,DATA_STORE_ID=$_DATA_STORE_ID,ENGINE_ID=$_ENGINE_ID,CONFIG_URI=$_CONFIG_URI'
 
   # Step 3: Configure or update Cloud Scheduler job with OIDC Auth
